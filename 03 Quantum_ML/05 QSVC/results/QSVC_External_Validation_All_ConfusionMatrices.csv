@@ -1,0 +1,25 @@
+Cohort,Model,Actual,Predicted,Count
+FengQ_2015,QSVC (8 features),healthy,healthy,27
+FengQ_2015,QSVC (8 features),healthy,CRC,34
+FengQ_2015,QSVC (8 features),CRC,healthy,18
+FengQ_2015,QSVC (8 features),CRC,CRC,28
+FengQ_2015,"Classical SVM (RBF, 8 features)",healthy,healthy,54
+FengQ_2015,"Classical SVM (RBF, 8 features)",healthy,CRC,7
+FengQ_2015,"Classical SVM (RBF, 8 features)",CRC,healthy,34
+FengQ_2015,"Classical SVM (RBF, 8 features)",CRC,CRC,12
+FengQ_2015,Logistic Regression (8 features),healthy,healthy,56
+FengQ_2015,Logistic Regression (8 features),healthy,CRC,5
+FengQ_2015,Logistic Regression (8 features),CRC,healthy,27
+FengQ_2015,Logistic Regression (8 features),CRC,CRC,19
+VogtmannE_2016,QSVC (8 features),healthy,healthy,32
+VogtmannE_2016,QSVC (8 features),healthy,CRC,20
+VogtmannE_2016,QSVC (8 features),CRC,healthy,26
+VogtmannE_2016,QSVC (8 features),CRC,CRC,26
+VogtmannE_2016,"Classical SVM (RBF, 8 features)",healthy,healthy,44
+VogtmannE_2016,"Classical SVM (RBF, 8 features)",healthy,CRC,8
+VogtmannE_2016,"Classical SVM (RBF, 8 features)",CRC,healthy,40
+VogtmannE_2016,"Classical SVM (RBF, 8 features)",CRC,CRC,12
+VogtmannE_2016,Logistic Regression (8 features),healthy,healthy,39
+VogtmannE_2016,Logistic Regression (8 features),healthy,CRC,13
+VogtmannE_2016,Logistic Regression (8 features),CRC,healthy,35
+VogtmannE_2016,Logistic Regression (8 features),CRC,CRC,17

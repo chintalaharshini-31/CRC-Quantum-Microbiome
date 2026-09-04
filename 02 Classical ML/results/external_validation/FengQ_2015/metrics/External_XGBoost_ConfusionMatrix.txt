@@ -1,0 +1,27 @@
+Confusion Matrix and Statistics
+
+          Reference
+Prediction healthy CRC
+   healthy      59  40
+   CRC           2   6
+                                          
+               Accuracy : 0.6075          
+                 95% CI : (0.5084, 0.7005)
+    No Information Rate : 0.5701          
+    P-Value [Acc > NIR] : 0.248           
+                                          
+                  Kappa : 0.1087          
+                                          
+ Mcnemar's Test P-Value : 1.135e-08       
+                                          
+            Sensitivity : 0.13043         
+            Specificity : 0.96721         
+         Pos Pred Value : 0.75000         
+         Neg Pred Value : 0.59596         
+             Prevalence : 0.42991         
+         Detection Rate : 0.05607         
+   Detection Prevalence : 0.07477         
+      Balanced Accuracy : 0.54882         
+                                          
+       'Positive' Class : CRC             
+                                          

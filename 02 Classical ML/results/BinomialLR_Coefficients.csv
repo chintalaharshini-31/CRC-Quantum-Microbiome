@@ -1,0 +1,21 @@
+"Feature","Estimate","OddsRatio","Microbe","Rank"
+"k__Bacteria.p__Firmicutes.c__Clostridia.o__Clostridiales.f__Peptostreptococcaceae.g__Peptostreptococcus.s__Peptostreptococcus_stomatis",-805.759937318557,0,"Peptostreptococcus Peptostreptococcus_stomatis",1
+"k__Bacteria.p__Firmicutes.c__Tissierellia.o__Tissierellales.f__Peptoniphilaceae.g__Parvimonas.s__Parvimonas_micra",-47.5056728597103,0.00000000000000000000233640656524799,"Parvimonas Parvimonas_micra",2
+"k__Bacteria.p__Proteobacteria.c__Deltaproteobacteria.o__Desulfovibrionales.f__Desulfovibrionaceae.g__Desulfovibrio.s__Desulfovibrio_piger",-28.0927757041062,0.000000000000630176973846223,"Desulfovibrio Desulfovibrio_piger",3
+"k__Bacteria.p__Fusobacteria.c__Fusobacteriia.o__Fusobacteriales.f__Fusobacteriaceae.g__Fusobacterium.s__Fusobacterium_nucleatum",-13.3205827389187,0.00000164037983060193,"Fusobacterium Fusobacterium_nucleatum",4
+"k__Bacteria.p__Firmicutes.c__Clostridia.o__Clostridiales.f__Clostridiaceae.g__Hungatella.s__Hungatella_hathewayi",-10.4021493991492,0.0000303671417027476,"Hungatella Hungatella_hathewayi",5
+"k__Bacteria.p__Firmicutes.c__Bacilli.o__Lactobacillales.f__Streptococcaceae.g__Streptococcus.s__Streptococcus_salivarius",10.1159919663774,24735.4314493338,"Streptococcus Streptococcus_salivarius",6
+"k__Bacteria.p__Firmicutes.c__Negativicutes.o__Veillonellales.f__Veillonellaceae.g__Dialister.s__Dialister_pneumosintes",-8.25041385376415,0.000261150456834746,"Dialister Dialister_pneumosintes",7
+"k__Bacteria.p__Firmicutes.c__Clostridia.o__Clostridiales.f__Clostridiales_Family_XIII_Incertae_Sedis.g__Mogibacterium.s__Mogibacterium_timidum",-7.50230447953941,0.000551811266017886,"Mogibacterium Mogibacterium_timidum",8
+"k__Bacteria.p__Firmicutes.c__Clostridia.o__Clostridiales.f__Ruminococcaceae.g__Ruminococcus.s__Ruminococcus_bicirculans",7.067063112478,1172.69888712111,"Ruminococcus Ruminococcus_bicirculans",9
+"k__Bacteria.p__Firmicutes.c__Clostridia.o__Clostridiales.f__Lachnospiraceae.g__Blautia.s__Blautia_wexlerae",4.55745884610129,95.3408958497973,"Blautia Blautia_wexlerae",10
+"k__Bacteria.p__Firmicutes.c__Clostridia.o__Clostridiales.f__Ruminococcaceae.g__Flavonifractor.s__Flavonifractor_plautii",-3.88432308500435,0.02056174260356,"Flavonifractor Flavonifractor_plautii",11
+"k__Bacteria.p__Bacteroidetes.c__Bacteroidia.o__Bacteroidales.f__Bacteroidaceae.g__Bacteroides.s__Bacteroides_uniformis",-3.7823023668393,0.0227702056610987,"Bacteroides Bacteroides_uniformis",12
+"k__Bacteria.p__Firmicutes.c__Clostridia.o__Clostridiales.f__Lachnospiraceae.g__Lachnospiraceae_unclassified.s__Eubacterium_rectale",3.5083083787933,33.3917338153457,"Lachnospiraceae_unclassified Eubacterium_rectale",13
+"k__Bacteria.p__Firmicutes.c__Clostridia.o__Clostridiales.f__Peptostreptococcaceae.g__Intestinibacter.s__Intestinibacter_bartlettii",2.47044385445829,11.8276954621128,"Intestinibacter Intestinibacter_bartlettii",14
+"k__Bacteria.p__Firmicutes.c__Clostridia.o__Clostridiales.f__Oscillospiraceae.g__Oscillibacter.s__Oscillibacter_sp_CAG_241",2.13276568153324,8.43817186550902,"Oscillibacter Oscillibacter_sp_CAG_241",15
+"k__Bacteria.p__Proteobacteria.c__Betaproteobacteria.o__Burkholderiales.f__Sutterellaceae.g__Turicimonas.s__Turicimonas_muris",1.76018565788668,5.8135166194259,"Turicimonas Turicimonas_muris",16
+"k__Bacteria.p__Proteobacteria.c__Deltaproteobacteria.o__Desulfovibrionales.f__Desulfovibrionaceae.g__Bilophila.s__Bilophila_wadsworthia",1.71137225320501,5.53655382084927,"Bilophila Bilophila_wadsworthia",17
+"k__Bacteria.p__Firmicutes.c__Clostridia.o__Clostridiales.f__Eubacteriaceae.g__Eubacterium.s__Eubacterium_hallii",-1.51110500213081,0.220666006782176,"Eubacterium Eubacterium_hallii",18
+"k__Bacteria.p__Firmicutes.c__Clostridia.o__Clostridiales.f__Lachnospiraceae.g__Anaerostipes.s__Anaerostipes_hadrus",1.42514901577997,4.15847747535182,"Anaerostipes Anaerostipes_hadrus",19
+"k__Bacteria.p__Firmicutes.c__Clostridia.o__Clostridiales.f__Ruminococcaceae.g__Ruthenibacterium.s__Ruthenibacterium_lactatiformans",-1.22632370421434,0.293369109264172,"Ruthenibacterium Ruthenibacterium_lactatiformans",20

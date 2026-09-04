@@ -1,0 +1,23 @@
+GITHUB PUSH - CLEAN FINAL REPOSITORY
+
+This folder is already initialized as a Git repository and contains one clean commit.
+The repository remote is set to:
+https://github.com/chintalaharshini-31/CRC-Quantum-Microbiome.git
+
+1. Delete the old GitHub repository only if you want a completely fresh history.
+2. Re-create an EMPTY repository with the same name: CRC-Quantum-Microbiome
+   Do not add a README, .gitignore, or license during GitHub creation.
+3. Extract this folder.
+4. Open a terminal in this folder.
+5. Run:
+
+   git push -u origin main
+
+That is it.
+
+Important: this repository snapshot does not contain the manuscript DOCX.
+Make the two manuscript-only changes separately before submission:
+- pROC version in Methods: 1.19.1
+- QSVC Table 7 bootstrap CI endpoints: use the current saved QSVC bootstrap CSV values.
+
+Do not rerun the scientific analyses just to push this repository.

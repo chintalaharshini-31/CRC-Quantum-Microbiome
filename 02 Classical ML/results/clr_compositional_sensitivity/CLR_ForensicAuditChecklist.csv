@@ -1,0 +1,19 @@
+"Item","Verified"
+"Frozen primary 92/22 split reused",TRUE
+"49 Healthy / 43 CRC training composition preserved",TRUE
+"Exactly the canonical 20 features used",TRUE
+"Zero-handling parameters estimated from training data only",TRUE
+"Same training-derived pseudocount applied to test data",TRUE
+"Same training-derived pseudocount applied to external cohorts",TRUE
+"Samples re-closed before CLR",TRUE
+"CLR row sums approximately zero",TRUE
+"CLR scaler fitted on training data only",TRUE
+"Internal test held out until after model fitting",TRUE
+"External cohorts used only after frozen models/transforms",TRUE
+"External cohort definitions use study_condition",TRUE
+"Classification threshold fixed at 0.50",TRUE
+"Continuous CRC probabilities used for AUC",TRUE
+"Bootstrap CIs use stratified class-wise resampling",TRUE
+"Bootstrap B = 2000",TRUE
+"No primary result/model files overwritten",TRUE
+"External outputs stored in CLR sensitivity directory",TRUE

@@ -1,0 +1,1307 @@
+---
+title: "Support Vector Machine Classification for Colorectal Cancer vs Healthy Microbiome Classification (Binary Exploratory Analysis)"
+author: "Harshini Chintala"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    theme: cosmo
+    highlight: tango
+    df_print: paged
+    fig_caption: true
+    self_contained: true
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  collapse = TRUE,
+  comment = "##",
+  fig.width = 7.2,
+  fig.height = 5.2,
+  dpi = 300,
+  fig.align = "center",
+  out.width = "92%",
+  results = "markup"
+)
+
+options(width = 90, scipen = 999)
+source("../../R/project_setup.R")
+set.seed(1910)
+
+# Classical notebook output locations.
+project_dir <- classical_dir
+results_dir <- file.path(classical_dir, "results")
+models_dir <- file.path(classical_dir, "models")
+data_dir <- file.path(classical_dir, "data")
+reports_dir <- file.path(classical_dir, "reports")
+figures_dir <- file.path(classical_dir, "figures")
+for (d in c(results_dir, models_dir, data_dir, reports_dir, figures_dir)) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+
+```
+
+## Notebook roadmap
+
+**Purpose:** This notebook is one reproducible component of the CRC microbiome classification pipeline.
+
+**Execution order**
+1. Load the project environment and fixed random seed (`1910`).
+2. Load only the validated project artifacts required for this analysis.
+3. Perform the analysis exactly as documented below.
+4. Generate tables/figures and save machine-readable outputs.
+5. Record the session information used for the run.
+
+**Output contract:** generated tables, figures, model objects, audit files, and session information are written under `02 Classical ML/results/`. The notebook itself renders to HTML with a floating table of contents, so the sections can be navigated from the left-hand panel in the knitted document.
+
+**Reproducibility rule:** this repository preserves the validated analysis logic and project-wide seed. Environment restoration is handled by `renv.lock` for R and `requirements.txt` for Python. The notebooks do not silently install unpinned packages during knitting.
+
+### Reproducibility constants
+
+- Project seed: **1910**
+- Discovery cohort: **ZellerG_2014**
+- Primary task: **Healthy vs CRC; adenoma excluded**
+- Frozen discovery split: **92 training / 22 held-out test samples**
+- Primary feature panel: **20 Boruta-selected features**
+- External cohorts: **FengQ_2015** and **VogtmannE_2016**
+
+# Introduction
+
+Support Vector Machine (SVM) is a supervised learning algorithm that seeks the decision boundary maximizing the margin between classes in feature space. With a radial basis function (RBF) kernel, SVM implicitly maps the input features into a higher-dimensional space where classes that are not linearly separable in the original feature space may become separable, without ever computing that mapping explicitly (the "kernel trick"). Because SVM's decision boundary is defined entirely in terms of distances between observations, the scale of every predictor directly affects the fitted boundary — a property that distinguishes it from the tree-based models used elsewhere in this project.
+
+**Biological objective:** This notebook is a secondary, exploratory analysis of the same Zeller et al. (2014) gut microbiome dataset used throughout this project. Rather than the full three-class problem (Healthy, Adenoma, CRC) evaluated in the main SVM notebook, Adenoma samples are excluded entirely and the model is restricted to a simpler, sharper biological question: does the gut microbial abundance profile distinguish colorectal cancer (CRC) patients from healthy controls?
+
+**Machine learning objective:** Train and validate a binary SVM classifier using the same preprocessing pipeline, cross-validation strategy, and reporting structure as the finalized Binomial Logistic Regression, binary Random Forest, and binary XGBoost notebooks, so that binary SVM performance is directly comparable to those binary baselines. This notebook is a standalone exploratory supplement and does not replace or modify the existing multiclass SVM notebook; all objects, models, and output files use a distinct `_Binary` naming convention to avoid any collision with the three-class analysis.
+
+**Why SVM is appropriate for microbiome abundance data:** Microbial abundance data is high-dimensional, and an RBF-kernel SVM can capture non-linear class boundaries between Healthy and CRC samples without requiring the analyst to specify interaction terms, unlike logistic regression. Because SVM is a margin-maximizing, distance-based classifier rather than a tree-based ensemble, it offers a genuinely different inductive bias from Random Forest and XGBoost, making it a useful additional comparison point when evaluating which classical/ensemble modeling strategy best separates Healthy from CRC in this dataset. This distance-based nature also makes correct feature scaling mathematically essential for SVM, in a way that it is not for the tree-based models in this project.
+
+This notebook implements a complete binary SVM workflow including data preprocessing, Adenoma exclusion, Boruta feature selection, model training with explicit hyperparameter tuning, prediction, performance evaluation, ROC analysis, support vector summary statistics, and interpretation of microbial biomarkers specific to the Healthy vs CRC comparison.
+
+
+
+
+
+# Import Dataset
+
+```{r}
+# ==========================================================
+# Load Dataset
+# ==========================================================
+
+library(curatedMetagenomicData)
+library(TreeSummarizedExperiment)
+library(dplyr)
+library(caret)
+library(kernlab)
+library(pROC)
+library(Boruta)
+library(ggplot2)
+
+# Download/load Zeller dataset
+zeller <- curatedMetagenomicData(
+  "ZellerG_2014.relative_abundance",
+  dryrun = FALSE
+)[[1]]
+
+# Extract abundance matrix
+abundance <- assay(zeller)
+
+# Transpose:
+# Rows = samples
+# Columns = microbial species
+X <- as.data.frame(t(abundance))
+
+# Disease labels
+y <- colData(zeller)$study_condition
+
+# Combine into one dataframe
+crc_data <- X
+crc_data$disease <- y
+
+# Check dimensions
+dim(crc_data)
+
+# Class distribution
+table(crc_data$disease)
+```
+
+The Zeller et al. (2014) colorectal cancer dataset consists of 652 microbial relative-abundance features measured across 156 stool samples, spanning three disease states: healthy controls, adenoma, and colorectal cancer.
+
+# Create Binary Dataset
+
+```{r}
+# ==========================================================
+# Create Binary Dataset (Healthy vs CRC only)
+# ==========================================================
+
+binary_data <- crc_data %>%
+  # Rename "control" to "healthy" before filtering
+  mutate(disease = case_match(disease, "control" ~ "healthy", .default = disease)) %>%
+  # Keep only Healthy and CRC — Adenoma is excluded completely
+  filter(disease %in% c("healthy", "CRC"))
+
+# Drop unused factor levels so "adenoma" is removed completely
+binary_data$disease <- factor(binary_data$disease)
+
+# Check dimensions
+dim(binary_data)
+
+# Verify class distribution
+table(binary_data$disease)
+```
+
+Adenoma samples are removed entirely before any preprocessing, scaling, feature selection, training, tuning, or evaluation takes place, so that no information from the excluded class can leak into the binary pipeline. This mirrors the class handling used in the Binomial Logistic Regression, binary Random Forest, and binary XGBoost notebooks, restricting the problem to a direct Healthy vs CRC comparison.
+
+# Train-Test Split
+
+```{r}
+# ==========================================================
+# Train-Test Split (shared across binary model notebooks)
+# ==========================================================
+
+train_index_path <- file.path(models_dir, "BinaryClass_Train_Index.rds")
+
+if (file.exists(train_index_path)) {
+
+  # Reuse the same split used by any other binary model notebook
+  train_index <- readRDS(train_index_path)
+
+} else {
+
+  # First notebook to run creates and saves the shared binary split
+  set.seed(1910)
+
+  train_index <- createDataPartition(
+    binary_data$disease,
+    p = 0.80,
+    list = FALSE
+  )
+
+  saveRDS(train_index, train_index_path)
+
+}
+
+# Training dataset
+train_data <- binary_data[train_index, ]
+
+# Testing dataset
+test_data <- binary_data[-train_index, ]
+
+# Check dimensions
+dim(train_data)
+dim(test_data)
+
+# Verify class distribution
+prop.table(table(train_data$disease))
+prop.table(table(test_data$disease))
+```
+
+An 80:20 stratified split preserves the relative proportions of Healthy and CRC samples in both the training and testing sets. `train_index` is cached under the shared `BinaryClass_Train_Index.rds` file — the same file created by the binary Random Forest and binary XGBoost notebooks — and reused here, so that every binary classifier in this project is trained and evaluated on identical data partitions for a fair comparison.
+
+# Separate Features and Labels
+
+```{r}
+# ==========================================================
+# Separate Features and Labels
+# ==========================================================
+
+# Training features
+X_train_raw <- train_data %>%
+  select(-disease)
+
+# Testing features
+X_test_raw <- test_data %>%
+  select(-disease)
+
+# Training labels
+y_train <- train_data$disease
+
+# Testing labels
+y_test <- test_data$disease
+
+# Check dimensions
+cat("Training Features:", dim(X_train_raw), "\n")
+cat("Testing Features :", dim(X_test_raw), "\n")
+
+# Check class distribution
+table(y_train)
+table(y_test)
+```
+
+# Near Zero Variance Removal
+
+```{r}
+# ==========================================================
+# Remove Near-Zero Variance Features
+# ==========================================================
+
+# Identify near-zero variance predictors (training data only)
+nzv <- nearZeroVar(X_train_raw)
+
+cat("Number of Near-Zero Variance Features:", length(nzv), "\n")
+
+# Remove them from training and testing data
+if (length(nzv) > 0) {
+
+  X_train_nzv <- X_train_raw[, -nzv]
+  X_test_nzv  <- X_test_raw[, -nzv]
+
+} else {
+
+  X_train_nzv <- X_train_raw
+  X_test_nzv  <- X_test_raw
+
+}
+
+# Check updated dimensions
+cat("Training Features:", dim(X_train_nzv), "\n")
+cat("Testing Features :", dim(X_test_nzv), "\n")
+```
+
+Near-zero variance filtering is computed exclusively on the training data to avoid information leakage from the test set. Microbial abundance data typically contains many taxa that are absent or nearly constant across almost all samples; these features carry little discriminative signal, can destabilize resampling-based model training, and are removed before feature selection. The same columns identified from the training data are then dropped from the test data so that both sets retain an identical feature space.
+
+# Feature Selection using Boruta
+
+```{r}
+# ==========================================================
+# Feature Selection using Boruta (training data only)
+# ==========================================================
+
+set.seed(1910)
+
+boruta_data <- data.frame(
+  Disease = y_train,
+  X_train_nzv,
+  check.names = FALSE
+)
+
+boruta_model <- Boruta(
+  Disease ~ .,
+  data = boruta_data,
+  doTrace = 2
+)
+
+boruta_final <- TentativeRoughFix(boruta_model)
+
+selected_features <- getSelectedAttributes(
+  boruta_final,
+  withTentative = FALSE
+)
+
+cat("Number of selected features:",
+    length(selected_features), "\n")
+
+print(selected_features)
+
+X_train_boruta <- X_train_nzv[, selected_features, drop = FALSE]
+
+X_test_boruta <- X_test_nzv[, selected_features, drop = FALSE]
+```
+
+```{r}
+saveRDS(
+  boruta_model,
+  file.path(
+    models_dir,
+    "Boruta_Model_Binary_SVM.rds"
+  )
+)
+
+cat("Boruta model saved successfully.\n")
+```
+
+```{r}
+# ==========================================================
+# Save Selected Features
+# ==========================================================
+
+selected_features_df <- data.frame(
+  Feature = selected_features
+)
+
+write.csv(
+  selected_features_df,
+  file.path(
+    results_dir,
+    "SVMBinary_Selected_Features.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("Selected features saved successfully.\n")
+```
+
+Boruta is used here as the dedicated preprocessing feature-selection step, exactly as in the Binomial, Multinomial, Elastic Net, Random Forest, XGBoost, and multiclass SVM notebooks. It works by comparing the importance of each real feature against randomized "shadow" copies of that feature across repeated Random Forest runs (Boruta's internal test model is always a Random Forest, regardless of which model is ultimately trained downstream), retaining only predictors that are confirmed to carry more signal than noise. Because the Healthy vs CRC comparison is a different, simpler classification problem than the three-class task, Boruta is re-run here on the binary training data rather than reusing the three-class selected feature set — the confirmed features may therefore differ from the multiclass notebook. `TentativeRoughFix()` forces a final decision on any features left "Tentative" after the confirmed run, and `getSelectedAttributes()` extracts the confirmed feature set that is carried forward into scaling and model training.
+
+# Feature Scaling
+
+```{r}
+# ==========================================================
+# Feature Scaling
+# ==========================================================
+# Feature scaling is especially important for SVM. Unlike the
+# tree-based splits used by Random Forest and XGBoost, SVM's
+# decision boundary is defined by distances (and, for the RBF
+# kernel, similarities computed via a distance-based kernel
+# function) between observations in feature space. If features
+# are left on their original scales, predictors with larger
+# numeric ranges would dominate the distance calculation purely
+# as an artifact of scale, regardless of their actual biological
+# relevance. Centering and scaling every feature to comparable
+# ranges ensures the SVM decision boundary reflects genuine
+# differences in microbial abundance patterns rather than
+# differences in measurement scale.
+
+# Learn scaling parameters from training data only
+scaler <- preProcess(
+  X_train_boruta,
+  method = c("center", "scale")
+)
+
+# Scale training and testing data
+X_train_scaled <- predict(
+  scaler,
+  X_train_boruta
+)
+
+X_test_scaled <- predict(
+  scaler,
+  X_test_boruta
+)
+
+saveRDS(
+  scaler,
+  file.path(
+    models_dir,
+    "Scaler_Binary_SVM.rds"
+  )
+)
+
+cat("Training and testing data scaled successfully.\n")
+```
+
+# Standardize Feature Names
+
+```{r}
+# ==========================================================
+# Standardize Feature Names
+# ==========================================================
+
+feature_name_map <- data.frame(
+  Original = colnames(X_train_scaled),
+  Syntactic = make.names(
+    colnames(X_train_scaled),
+    unique = TRUE
+  ),
+  stringsAsFactors = FALSE
+)
+
+colnames(X_train_scaled) <- feature_name_map$Syntactic
+colnames(X_test_scaled) <- feature_name_map$Syntactic
+
+write.csv(
+  feature_name_map,
+  file.path(
+    results_dir,
+    "SVMBinary_FeatureNameMap.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("Feature names standardized successfully.\n")
+```
+
+Full microbial taxonomic strings (e.g. `k__Bacteria|p__Firmicutes|...|s__Faecalibacterium_prausnitzii`) contain characters that are not syntactically valid R column names. `make.names()` converts every feature name into a valid identifier while `feature_name_map` preserves the original taxonomic string so it can be restored for reporting and plotting later in the notebook.
+
+# Create Training and Testing Data Frames
+
+```{r}
+# ==========================================================
+# Create Training and Testing Data Frames
+# ==========================================================
+
+train_df <- data.frame(
+    X_train_scaled,
+    disease = y_train
+)
+
+test_df <- data.frame(
+  X_test_scaled,
+  disease = y_test
+)
+
+str(train_df)
+str(test_df)
+```
+
+# Shared Cross-Validation Folds
+
+```{r}
+# ==========================================================
+# Shared Repeated CV Folds (reused across binary model
+# notebooks for a fair, identical resampling comparison)
+# ==========================================================
+
+cv_folds_path <- file.path(models_dir, "BinaryClass_CV_Folds.rds")
+
+if (file.exists(cv_folds_path)) {
+
+  # Reuse the same folds used by the binary Random Forest
+  # and binary XGBoost notebooks
+  cv_folds <- readRDS(cv_folds_path)
+
+} else {
+
+  # First notebook to run creates and saves the shared folds
+  set.seed(1910)
+
+  cv_folds <- createMultiFolds(
+    y_train,
+    k = 10,
+    times = 5
+  )
+
+  saveRDS(cv_folds, cv_folds_path)
+
+}
+```
+
+Repeated 10-fold cross-validation (5 repeats) is the resampling scheme shared across every binary classifier in this project. The predefined fold indices are cached under `BinaryClass_CV_Folds.rds` and reused here from the binary Random Forest and binary XGBoost notebooks, so that all three binary models are evaluated on identical resampling partitions.
+
+# Train Support Vector Machine Model
+
+```{r}
+# ==========================================================
+# Train Binary Support Vector Machine Model (caret)
+# ==========================================================
+
+train_control <- trainControl(
+  method = "repeatedcv",
+  number = 10,
+  repeats = 5,
+  classProbs = TRUE,
+  savePredictions = "final",
+  summaryFunction = twoClassSummary,
+  index = cv_folds
+)
+
+# Explicit tuning grid for svmRadial, identical in shape to the
+# multiclass SVM notebook. sigma controls the width of the RBF
+# kernel (how far the influence of a single training example
+# reaches); C controls the cost of misclassification (the
+# margin/regularization trade-off). Both are searched explicitly
+# across an order-of-magnitude range rather than relying on
+# caret's default of testing only a handful of values.
+tune_grid <- expand.grid(
+  sigma = c(0.005, 0.01, 0.02, 0.05),
+  C     = c(0.25, 0.5, 1, 2, 4, 8)
+)
+
+tune_grid
+
+set.seed(1910)
+
+svm_binary_model <- caret::train(
+  disease ~ .,
+  data = train_df,
+  method = "svmRadial",
+  trControl = train_control,
+  metric = "ROC",
+  tuneGrid = tune_grid
+)
+
+cat("Binary Support Vector Machine model trained successfully using caret::train() with repeated 10-fold CV (5 repeats) on shared binary folds.\n")
+
+svm_binary_model
+```
+
+An explicit tuning grid is supplied across `sigma` (RBF kernel width) and `C` (misclassification cost / margin regularization), rather than relying on caret's default of testing only a small automatically chosen range, using the same grid as the multiclass SVM notebook so that the two analyses remain directly comparable. A small `sigma` produces a smoother, more global decision boundary while a large `sigma` allows sharper, more localized boundaries that can overfit; a small `C` favors a wider margin at the cost of some training misclassifications while a large `C` fits the training data more tightly at the risk of overfitting. `twoClassSummary` and `metric = "ROC"` are used in place of the multiclass notebook's `multiClassSummary`/`Accuracy` combination, consistent with the binary evaluation convention already established in the Binomial Logistic Regression, binary Random Forest, and binary XGBoost notebooks. The best model is selected using cross-validated ROC AUC, which is more robust to any residual class imbalance between Healthy and CRC than raw Accuracy.
+
+# Save Trained Model
+
+```{r}
+# ==========================================================
+# Save Trained Model
+# ==========================================================
+
+saveRDS(
+  svm_binary_model,
+  file = file.path(
+    models_dir,
+    "SVMBinary_Model.rds"
+  )
+)
+
+cat("Model saved successfully.\n")
+```
+
+```{r}
+# ==========================================================
+# Save Cross-Validation Results
+# ==========================================================
+
+cv_results   <- svm_binary_model$results
+cv_resamples <- svm_binary_model$resample
+
+write.csv(
+  cv_results,
+  file.path(
+    results_dir,
+    "SVMBinary_CV_Results.csv"
+  ),
+  row.names = FALSE
+)
+
+write.csv(
+  cv_resamples,
+  file.path(
+    results_dir,
+    "SVMBinary_CV_Resamples.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("Cross-validation results saved successfully.\n")
+```
+
+# Model Summary
+
+```{r}
+# ==========================================================
+# Model Summary
+# ==========================================================
+
+svm_binary_model$bestTune
+
+# Cross-validated resampling summary (mean across folds/repeats)
+svm_binary_model$results
+```
+
+The best-performing model used `sigma = ` `r svm_binary_model$bestTune$sigma` and `C = ` `r svm_binary_model$bestTune$C`. A relatively small selected `sigma` indicates the cross-validation favored a smoother, more global decision boundary over highly localized ones, which tends to generalize better given the limited training sample; the selected `C` reflects the trade-off cross-validation found between maximizing the margin and fitting borderline training samples exactly, on this two-class subset of the data.
+
+
+```{r}
+# ==========================================================
+# Save Final Hyperparameters
+# ==========================================================
+
+svm_final_hyperparameters <- svm_binary_model$bestTune
+
+write.csv(
+  svm_final_hyperparameters,
+  file.path(
+    results_dir,
+    "SVMBinary_Final_Hyperparameters.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("Final SVM hyperparameters saved successfully.\n")
+```
+
+
+# Support Vectors Summary
+
+```{r}
+# ==========================================================
+# Support Vectors Summary
+# ==========================================================
+# Support vectors are the training observations lying on or
+# inside the margin, and are the only observations that
+# actually determine the fitted decision boundary; every other
+# training point could be removed without changing the model.
+
+svm_final_fit <- svm_binary_model$finalModel
+
+svm_final_fit
+
+n_support_vectors <- kernlab::nSV(svm_final_fit)
+
+cat("Number of support vectors:", n_support_vectors, "\n")
+cat("Number of training samples:", nrow(train_df), "\n")
+cat(
+  "Proportion of training samples used as support vectors:",
+  round(n_support_vectors / nrow(train_df), 3),
+  "\n"
+)
+
+support_vector_summary <- data.frame(
+  Metric = c(
+    "Number of Support Vectors",
+    "Number of Training Samples",
+    "Proportion of Training Samples as Support Vectors"
+  ),
+  Value = c(
+    n_support_vectors,
+    nrow(train_df),
+    round(n_support_vectors / nrow(train_df), 3)
+  )
+)
+
+support_vector_summary
+
+write.csv(
+  support_vector_summary,
+  file.path(
+    results_dir,
+    "SVMBinary_SupportVectorSummary.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("Support vector summary saved successfully.\n")
+```
+
+A high proportion of training samples retained as support vectors suggests the Healthy vs CRC classes overlap substantially in the selected microbial feature space, forcing the margin to rely on a large share of the training data; a low proportion indicates the two classes are more cleanly separated, with only a small subset of borderline samples actually shaping the decision boundary. This is a diagnostic specific to margin-based classifiers like SVM and has no direct analogue in the tree-based Random Forest or XGBoost notebooks.
+
+# Variable Importance
+
+```{r}
+# ==========================================================
+# Variable Importance
+# ==========================================================
+# This is distinct from the Boruta feature-selection step above.
+# Boruta decided WHICH features entered the model; this section
+# interprets HOW informative each already-selected feature is
+# with respect to the trained classifier.
+#
+# kernlab's svmRadial has no internal, model-based importance
+# measure analogous to Random Forest's Gini/accuracy decrease or
+# XGBoost's Gain. For classification models without a built-in
+# importance measure, caret's varImp() instead fits a
+# model-independent ROC-curve filter: for each predictor, it
+# computes the area under the ROC curve using that single
+# predictor alone to distinguish Healthy from CRC, and reports
+# that AUC-based score as the "importance" of the feature. This
+# is therefore a univariate, model-derived-but-not-model-internal
+# importance measure, in contrast to Boruta's multivariate
+# confirm/reject test and distinct from Random Forest/XGBoost's
+# importance, which are computed from the fitted ensemble itself.
+
+var_importance <- varImp(svm_binary_model)
+
+var_importance
+
+var_imp_df <- as.data.frame(var_importance$importance)
+var_imp_df$Syntactic <- rownames(var_imp_df)
+
+var_imp_df_named <- var_imp_df %>%
+  dplyr::left_join(feature_name_map, by = "Syntactic") %>%
+  dplyr::mutate(
+    Original = dplyr::if_else(
+      is.na(Original),
+      Syntactic,
+      Original
+    )
+  ) %>%
+  dplyr::select(-Syntactic) %>%
+  dplyr::relocate(Original) %>%
+  dplyr::rename(Feature = Original)
+
+# Overall importance score used to rank features
+importance_score_col <- setdiff(colnames(var_imp_df_named), "Feature")
+
+var_imp_df_named$MeanImportance <- rowMeans(
+  var_imp_df_named[, importance_score_col, drop = FALSE]
+)
+
+# Ranked complete importance table
+var_imp_df_named <- var_imp_df_named[
+  order(var_imp_df_named$MeanImportance, decreasing = TRUE),
+]
+
+write.csv(
+  var_imp_df_named,
+  file.path(
+    results_dir,
+    "SVMBinary_VariableImportance.csv"
+  ),
+  row.names = FALSE
+)
+
+# Top 20 microbial biomarkers by SVM variable importance
+top20_importance <- head(var_imp_df_named, 20)
+
+top20_importance
+
+cat("SVM variable importance saved successfully.\n")
+```
+
+`MeanImportance` here reduces to a single Healthy-vs-CRC ROC AUC score per feature, since there are only two classes and therefore only one one-vs-rest comparison to average over (unlike the three-class notebook, where it is averaged across Healthy, Adenoma, and CRC). Because this measure evaluates each predictor individually rather than jointly (as Boruta does, and as Random Forest/XGBoost importance implicitly do through tree splits), it should be interpreted as each taxon's standalone separating power between Healthy and CRC rather than its specific contribution within the fitted binary SVM decision boundary.
+
+# Variable Importance Plot
+
+```{r}
+# ==========================================================
+# Variable Importance Plot
+# ==========================================================
+
+png(
+  file.path(
+    figures_dir,
+    "SVMBinary_VariableImportance_Default.png"
+  ),
+  width = 900,
+  height = 700,
+  res = 150
+)
+
+plot(var_importance, top = 20)
+
+dev.off()
+
+importance_plot_df <- top20_importance
+
+importance_plot <- ggplot(
+  importance_plot_df,
+  aes(
+    x = reorder(Feature, MeanImportance),
+    y = MeanImportance
+  )
+) +
+  geom_col(width = 0.7, fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Top 20 Features by SVM Variable Importance (Binary: Healthy vs CRC)",
+    x = "Feature",
+    y = "Mean Importance (ROC AUC)"
+  ) +
+  theme_minimal(base_size = 12)
+
+print(importance_plot)
+
+ggsave(
+  filename = file.path(
+    figures_dir,
+    "SVMBinary_VariableImportance.png"
+  ),
+  plot = importance_plot,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+cat("Feature importance plot saved successfully.\n")
+```
+
+The top-ranked features represent the microbial taxa that, individually, are most discriminative between Healthy and CRC samples by ROC AUC. These are candidate microbiome biomarkers specific to the Healthy vs CRC comparison and are examined further, with cleaned taxonomic names, in the Top Important Biomarkers section at the end of this notebook.
+
+# Predict Probabilities
+
+```{r}
+# ==========================================================
+# Predict Probabilities
+# ==========================================================
+
+# Predict class probabilities
+svm_binary_probabilities <- predict(
+  svm_binary_model,
+  newdata = test_df,
+  type = "prob"
+)
+
+head(svm_binary_probabilities)
+```
+
+# Predicted Classes
+
+```{r}
+# ==========================================================
+# Predicted Classes
+# ==========================================================
+
+# Predict disease classes
+svm_binary_predictions <- predict(
+  svm_binary_model,
+  newdata = test_df,
+  type = "raw"
+)
+
+head(svm_binary_predictions)
+
+table(svm_binary_predictions)
+```
+
+```{r}
+# ==========================================================
+# Save Predictions
+# ==========================================================
+
+prediction_results <- data.frame(
+  SampleID = rownames(test_data),
+  Actual = y_test,
+  Predicted = svm_binary_predictions,
+  Probability_CRC = svm_binary_probabilities$CRC,
+  Probability_Healthy = svm_binary_probabilities$healthy,
+  row.names = NULL
+)
+write.csv(
+  prediction_results,
+  file.path(
+    results_dir,
+    "SVMBinary_Predictions.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("Predictions saved successfully.\n")
+```
+
+# Confusion Matrix
+
+```{r}
+# ==========================================================
+# Confusion Matrix
+# ==========================================================
+
+conf_matrix <- confusionMatrix(
+  svm_binary_predictions,
+  y_test,
+  positive = "CRC"
+)
+
+conf_matrix
+```
+
+```{r}
+# ==========================================================
+# Save Confusion Matrix
+# ==========================================================
+
+capture.output(
+  conf_matrix,
+  file = file.path(
+    results_dir,
+    "SVMBinary_ConfusionMatrix.txt"
+  )
+)
+
+cat("Confusion matrix saved successfully.\n")
+```
+
+The confusion matrix reports agreement between the binary SVM's predicted disease labels and the true labels on the held-out 20% test set, along with overall Accuracy, Kappa, and Sensitivity/Specificity computed by `caret::confusionMatrix()`, with CRC set as the positive class, consistent with the Binomial Logistic Regression, binary Random Forest, and binary XGBoost notebooks.
+
+# Confusion Matrix Heatmap
+
+```{r}
+# ==========================================================
+# Confusion Matrix Heatmap
+# ==========================================================
+
+# Convert confusion matrix to dataframe
+conf_df <- as.data.frame(conf_matrix$table)
+
+# Plot
+confusion_plot <- ggplot(conf_df,
+                         aes(x = Prediction,
+                             y = Reference,
+                             fill = Freq)) +
+
+  geom_tile(color = "white") +
+
+  geom_text(aes(label = Freq),
+            size = 5,
+            fontface = "bold") +
+
+  scale_fill_gradient(
+    low = "white",
+    high = "steelblue"
+  ) +
+
+  labs(
+    title = "Confusion Matrix - Binary SVM (Healthy vs CRC)",
+    x = "Predicted Class",
+    y = "Actual Class",
+    fill = "Count"
+  ) +
+
+  theme_minimal(base_size = 14)
+
+confusion_plot
+```
+
+```{r}
+# ==========================================================
+# Save Confusion Matrix Plot
+# ==========================================================
+
+ggsave(
+  filename = file.path(
+    figures_dir,
+    "SVMBinary_ConfusionMatrix.png"
+  ),
+  plot = confusion_plot,
+  width = 7,
+  height = 6,
+  dpi = 300
+)
+
+cat("Confusion matrix plot saved successfully.\n")
+```
+
+# Overall Evaluation Metrics
+
+```{r}
+# ==========================================================
+# Overall Evaluation Metrics
+# ==========================================================
+
+evaluation_metrics <- data.frame(
+  Metric = c(
+    "Accuracy",
+    "Kappa",
+    "AccuracyLower",
+    "AccuracyUpper",
+    "AccuracyPValue",
+    "McNemarPValue"
+  ),
+  Value = c(
+    conf_matrix$overall["Accuracy"],
+    conf_matrix$overall["Kappa"],
+    conf_matrix$overall["AccuracyLower"],
+    conf_matrix$overall["AccuracyUpper"],
+    conf_matrix$overall["AccuracyPValue"],
+    conf_matrix$overall["McnemarPValue"]
+  )
+)
+
+evaluation_metrics
+
+write.csv(
+  evaluation_metrics,
+  file.path(
+    results_dir,
+    "SVMBinary_OverallMetrics.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("Evaluation metrics saved successfully.\n")
+```
+
+# Class-wise Metrics
+
+```{r}
+# ==========================================================
+# Class-wise Evaluation Metrics
+# ==========================================================
+
+class_metrics <- as.data.frame(conf_matrix$byClass)
+
+class_metrics$Metric <- rownames(class_metrics)
+
+rownames(class_metrics) <- NULL
+
+colnames(class_metrics)[1] <- "Value"
+
+class_metrics
+
+write.csv(
+  class_metrics,
+  file.path(
+    results_dir,
+    "SVMBinary_ClassMetrics.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("Class-wise metrics saved successfully.\n")
+```
+
+Because this is now a two-class problem, `conf_matrix$byClass` returns a single named vector — Sensitivity, Specificity, Precision, Recall, F1, Prevalence, Detection Rate, Detection Prevalence, and Balanced Accuracy — computed with CRC as the positive class, rather than a per-class matrix as in the three-class notebook. Balanced Accuracy in particular is a useful complement to overall Accuracy here, since it averages Sensitivity and Specificity and is therefore insensitive to any residual imbalance between the Healthy and CRC sample counts.
+
+# Matthews Correlation Coefficient (MCC)
+
+```{r}
+# ==========================================================
+# Matthews Correlation Coefficient (MCC)
+# ==========================================================
+
+mcc_data <- data.frame(
+  truth = y_test,
+  prediction = svm_binary_predictions
+)
+
+mcc_value <- yardstick::mcc(
+  mcc_data,
+  truth = truth,
+  estimate = prediction
+)
+
+mcc_value
+
+write.csv(
+  mcc_value,
+  file.path(
+    results_dir,
+    "SVMBinary_MCC.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("MCC saved successfully.\n")
+```
+
+The Matthews Correlation Coefficient is a balanced summary statistic that accounts for all four cells of the binary confusion matrix simultaneously. A value close to +1 indicates near-perfect classification, 0 indicates performance no better than random assignment, and negative values indicate systematic disagreement between predicted and actual labels.
+
+# ROC Curve
+
+```{r}
+# ==========================================================
+# ROC Curve
+# ==========================================================
+
+roc_binary <- roc(
+  response = y_test,
+  predictor = svm_binary_probabilities$CRC,
+  levels = c("healthy", "CRC")
+)
+
+plot(
+  roc_binary,
+  col = "blue",
+  lwd = 2,
+  main = "ROC Curve - Binary SVM (Healthy vs CRC)"
+)
+
+abline(
+  a = 0,
+  b = 1,
+  lty = 2,
+  col = "red"
+)
+```
+
+# Save ROC Plot
+
+```{r}
+# ==========================================================
+# Save ROC Plot
+# ==========================================================
+
+png(
+  file.path(
+    figures_dir,
+    "SVMBinary_ROC.png"
+  ),
+  width = 900,
+  height = 700,
+  res = 150
+)
+
+plot(
+  roc_binary,
+  col = "blue",
+  lwd = 2,
+  main = "ROC Curve - Binary SVM (Healthy vs CRC)"
+)
+
+abline(
+  a = 0,
+  b = 1,
+  lty = 2,
+  col = "red"
+)
+
+dev.off()
+
+cat("ROC plot saved successfully.\n")
+```
+
+A single ROC curve is sufficient here, unlike the one-vs-rest curves required in the three-class notebook, because CRC vs Healthy is inherently a binary discrimination problem. A curve that bows tightly toward the top-left corner, with AUC close to 1, indicates strong separability of CRC from Healthy samples based on the microbial abundance profile.
+
+# AUC values
+
+```{r}
+# ==========================================================
+# Area Under the Curve (AUC)
+# ==========================================================
+
+auc_binary <- auc(roc_binary)
+
+auc_binary
+```
+
+```{r}
+# ==========================================================
+# Save AUC Values
+# ==========================================================
+
+auc_results <- data.frame(
+  AUC = as.numeric(auc_binary)
+)
+
+auc_results
+
+write.csv(
+  auc_results,
+  file.path(
+    results_dir,
+    "SVMBinary_AUC.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("AUC saved successfully.\n")
+```
+
+# ROC Coordinates
+
+```{r}
+# ==========================================================
+# ROC Coordinates
+# ==========================================================
+
+roc_coordinates <- data.frame(
+  Specificity = roc_binary$specificities,
+  Sensitivity = roc_binary$sensitivities,
+  Threshold = roc_binary$thresholds
+)
+
+write.csv(
+  roc_coordinates,
+  file.path(
+    results_dir,
+    "SVMBinary_ROC_Coordinates.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("ROC coordinates saved successfully.\n")
+```
+
+# Top Important Biomarkers
+
+```{r}
+# ==========================================================
+# Top Important Biomarkers
+# ==========================================================
+
+top_biomarkers <- head(var_imp_df_named, 20) %>%
+  mutate(
+    # Extract genus and species from full taxonomic string
+    Microbe = sub(".*g__", "", Feature),
+    Microbe = sub("\\|s__", " ", Microbe),
+    Microbe = sub("\\|.*", "", Microbe),
+    Microbe = gsub("_", " ", Microbe),
+    Microbe = gsub("^([A-Za-z]+)\\.\\1\\s+", "\\1 ", Microbe),
+    Microbe = gsub("\\.", " ", Microbe)
+  )
+
+# If extraction fails (no genus/species tag found), keep original
+top_biomarkers$Microbe[
+  is.na(top_biomarkers$Microbe) | top_biomarkers$Microbe == ""
+] <- top_biomarkers$Feature[
+  is.na(top_biomarkers$Microbe) | top_biomarkers$Microbe == ""
+]
+
+top_biomarkers
+
+write.csv(
+  top_biomarkers,
+  file.path(
+    results_dir,
+    "SVMBinary_TopBiomarkers.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("Top biomarkers table saved successfully.\n")
+```
+
+```{r}
+#===============================================================
+# Plot Top Biomarkers
+#===============================================================
+
+biomarker_plot <- ggplot(
+  top_biomarkers,
+  aes(
+    x = reorder(Microbe, MeanImportance),
+    y = MeanImportance,
+    fill = MeanImportance
+  )
+) +
+  geom_col(width = 0.7) +
+  coord_flip() +
+  scale_fill_gradient(
+    low = "lightsteelblue",
+    high = "steelblue4"
+  ) +
+  labs(
+    title = "Top 20 Microbial Biomarkers - Binary SVM",
+    subtitle = "Ranked by univariate ROC AUC importance, Healthy vs CRC",
+    x = "Genus and Species",
+    y = "Mean Importance (ROC AUC)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, size = 9),
+    legend.position = "none"
+  )
+
+print(biomarker_plot)
+
+ggsave(
+  filename = file.path(
+    figures_dir,
+    "SVMBinary_TopBiomarkers.png"
+  ),
+  plot = biomarker_plot,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+cat("Top biomarkers plot saved successfully.\n")
+```
+
+These 20 taxa are the most individually discriminative features between Healthy and CRC samples by univariate ROC AUC. Unlike the Random Forest and XGBoost biomarker rankings, which reflect each taxon's realized contribution within the fitted ensemble, this ranking reflects each taxon's standalone separating power and does not account for interactions between features that the fitted SVM decision boundary may nonetheless be exploiting.
+
+# Model-Specific Interpretation
+
+Because kernlab's `svmRadial` provides no internal, model-based importance measure, this notebook's candidate biomarker list is necessarily univariate (per-feature ROC AUC) rather than derived from the fitted decision boundary itself, unlike the Random Forest and XGBoost binary notebooks. The Support Vectors Summary section above is the SVM-specific complement to this: the proportion of training samples retained as support vectors indicates how much the Healthy and CRC classes overlap in the Boruta-selected, scaled feature space, and therefore how much of the training data the fitted margin actually depends on. Restricting the comparison to Healthy vs CRC, and removing the intermediate Adenoma class, sharpens the classification task relative to the three-class notebook: the model no longer has to fit a boundary that also separates the biologically ambiguous adenoma state from both healthy and cancer samples, and can instead focus the margin purely on the Healthy-vs-CRC distinction. Taxa that rank highly here but were less prominent in the three-class SVM importance ranking are candidates whose association with CRC is diluted, in the multiclass setting, by Adenoma samples occupying an intermediate position in feature space between Healthy and CRC.
+
+# Conclusion
+
+This exploratory notebook trained a binary SVM classifier restricted to Healthy and CRC samples, using the same near-zero variance filtering, Boruta feature selection, scaling, and RBF-kernel `sigma`/`C` tuning grid established in the multiclass SVM notebook, adapted from `multiClassSummary`/Accuracy to `twoClassSummary`/ROC for the two-class setting. On the held-out test set, the model achieved an accuracy of `r round(conf_matrix$overall["Accuracy"], 3)`, a Kappa of `r round(conf_matrix$overall["Kappa"], 3)`, and an AUC of `r round(as.numeric(auc_binary), 3)`, using `sigma = ` `r svm_binary_model$bestTune$sigma` and `C = ` `r svm_binary_model$bestTune$C`, with `r n_support_vectors` of `r nrow(train_df)` training samples retained as support vectors and `r length(selected_features)` microbial features surviving Boruta selection on the binary training data. As a secondary, exploratory analysis, this notebook does not replace the three-class SVM evaluation; instead it isolates the Healthy-vs-CRC signal to identify which candidate biomarkers are most robust to the removal of Adenoma as an intermediate disease state, and establishes a binary SVM benchmark directly comparable to the binary Logistic Regression, binary Random Forest, and binary XGBoost baselines trained on the same two classes.
+
+# Session Information
+
+```{r}
+# ==========================================================
+# Session Information
+# ==========================================================
+
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(
+    reports_dir,
+    "SVMBinary_SessionInfo.txt"
+  )
+)
+
+sessionInfo()
+```
+
+## Session information
+
+The final section records the exact R session used for this knit. The same information is also saved as a text artifact so the HTML report and repository contain both a human-readable and machine-readable provenance record.
+
+```{r session-information}
+session_file <- file.path(
+  results_dir,
+  "session_info",
+  "03_Binary_SVM_CRC_vs_Healthy_sessionInfo.txt"
+)
+write_session_info(session_file)
+cat("Saved session information to:", session_file, "\n\n")
+sessionInfo()
+```

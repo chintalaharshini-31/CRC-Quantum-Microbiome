@@ -1,0 +1,17 @@
+02 Classical ML/scripts/01_Binomial_Logistic_Regression.Rmd
+02 Classical ML/scripts/02_Binary_RandomForest_CRC_vs_Healthy.Rmd
+02 Classical ML/scripts/03_Binary_SVM_CRC_vs_Healthy.Rmd
+02 Classical ML/scripts/04_Binary_XGBoost_CRC_vs_Healthy.Rmd
+02 Classical ML/scripts/05_Binary_LASSO_Sensitivity.Rmd
+02 Classical ML/scripts/06_CLR_Compositional_Sensitivity.Rmd
+02 Classical ML/scripts/07_Nested_CV_Sensitivity_Audit.Rmd
+02 Classical ML/scripts/08_XGBoost_Forensic_Audit.Rmd
+02 Classical ML/scripts/09_Feature_Selection_Stability.Rmd
+02 Classical ML/scripts/10_External_Validation_FengQ_2015.Rmd
+02 Classical ML/scripts/11_External_Validation_VogtmannE_2016.Rmd
+02 Classical ML/scripts/12_Model_Comparison.Rmd
+03 Quantum_ML/05 QSVC/01_QSVC_Data_Preparation.Rmd
+03 Quantum_ML/05 QSVC/02_QSVC_External_Validation_Prerequisite.Rmd
+03 Quantum_ML/05 QSVC/QSVC_CRC_vs_Healthy.ipynb
+03 Quantum_ML/05 QSVC/QSVC_External_Validation_CRC_vs_Healthy.ipynb
+03 Quantum_ML/05 QSVC/QSVC_External_Validation_CRC_vs_Healthy_with_DeLong.ipynb

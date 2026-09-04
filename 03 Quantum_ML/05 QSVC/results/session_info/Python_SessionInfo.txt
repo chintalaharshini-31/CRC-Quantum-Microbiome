@@ -1,0 +1,15 @@
+Python: 3.14.6
+Platform: Windows-11-10.0.26200-SP0
+Executable: c:\Users\HARSHINI\AppData\Local\Programs\Python\Python314\python.exe
+Working directory: c:\CRC\CRC_Quantum_Microbiome_Githb\CRC_Quantum_Microbiome_GitHub_RMD\03 Quantum_ML\05 QSVC
+Seed: 1910
+
+Installed package versions:
+qiskit: 2.5.1
+qiskit-machine-learning: 0.9.0
+qiskit-aer: 0.17.2
+scikit-learn: 1.9.0
+numpy: 2.5.1
+pandas: 3.0.5
+matplotlib: 3.11.1
+joblib: 1.5.3

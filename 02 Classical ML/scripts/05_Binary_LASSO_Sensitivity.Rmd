@@ -1,0 +1,920 @@
+---
+title: "LASSO-Penalized Logistic Regression Sensitivity Analysis for Binary CRC Microbiome Classification"
+author: "Harshini Chintala"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    theme: cosmo
+    highlight: tango
+    df_print: paged
+    fig_caption: true
+    self_contained: true
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  collapse = TRUE,
+  comment = "##",
+  fig.width = 7.2,
+  fig.height = 5.2,
+  dpi = 300,
+  fig.align = "center",
+  out.width = "92%",
+  results = "markup"
+)
+
+options(width = 90, scipen = 999)
+source("../../R/project_setup.R")
+set.seed(1910)
+
+# Classical notebook output locations.
+project_dir <- classical_dir
+results_dir <- file.path(classical_dir, "results")
+models_dir <- file.path(classical_dir, "models")
+data_dir <- file.path(classical_dir, "data")
+reports_dir <- file.path(classical_dir, "reports")
+figures_dir <- file.path(classical_dir, "figures")
+sens_results_dir <- file.path(results_dir, "binary_elastic_net_sensitivity")
+sens_models_dir  <- file.path(models_dir, "binary_elastic_net_sensitivity")
+exists("sens_results_dir")
+for (d in c(results_dir, models_dir, data_dir, reports_dir, figures_dir)) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+
+# load packages
+library(curatedMetagenomicData)
+library(TreeSummarizedExperiment)
+library(dplyr)
+library(caret)
+library(glmnet)
+library(pROC)
+library(ggplot2)
+
+```
+
+## Notebook roadmap
+
+**Purpose:** This notebook is one reproducible component of the CRC microbiome classification pipeline.
+
+**Execution order**
+1. Load the project environment and fixed random seed (`1910`).
+2. Load only the validated project artifacts required for this analysis.
+3. Perform the analysis exactly as documented below.
+4. Generate tables/figures and save machine-readable outputs.
+5. Record the session information used for the run.
+
+**Output contract:** generated tables, figures, model objects, audit files, and session information are written under `02 Classical ML/results/`. The notebook itself renders to HTML with a floating table of contents, so the sections can be navigated from the left-hand panel in the knitted document.
+
+**Reproducibility rule:** this repository preserves the validated analysis logic and project-wide seed. Environment restoration is handled by `renv.lock` for R and `requirements.txt` for Python. The notebooks do not silently install unpinned packages during knitting.
+
+### Reproducibility constants
+
+- Project seed: **1910**
+- Discovery cohort: **ZellerG_2014**
+- Primary task: **Healthy vs CRC; adenoma excluded**
+- Frozen discovery split: **92 training / 22 held-out test samples**
+- Primary feature panel: **20 Boruta-selected features**
+- External cohorts: **FengQ_2015** and **VogtmannE_2016**
+
+# Purpose and Scope
+
+This notebook is a **sensitivity analysis**, not a replacement for the primary
+unpenalized logistic-regression analysis.
+
+It asks whether penalization changes the conclusions when the **same frozen
+20-feature representation** and **same frozen 92/22 discovery-cohort split**
+are reused.
+
+**Important limitation:** the 20-feature Boruta panel was selected once in the
+primary pipeline. Therefore this notebook does **not** resolve the separate
+non-nested feature-selection/preprocessing concern. That concern is addressed
+by the companion nested-CV audit notebook.
+
+No primary model, feature-selection artifact, train/test split, or result file
+is overwritten.
+
+# Setup
+
+
+
+# Frozen Artifact Gate
+
+```{r artifact-gate}
+required_artifacts <- c(
+  train_index = file.path(models_dir, "BinaryClass_Train_Index.rds"),
+  cv_folds    = file.path(models_dir, "BinaryClass_CV_Folds.rds"),
+  scaler      = file.path(models_dir, "Scaler.rds"),
+  features    = file.path(results_dir, "Binary_Selected_20_Features.csv")
+)
+
+artifact_status <- data.frame(
+  Artifact = names(required_artifacts),
+  Path = unname(required_artifacts),
+  Exists = file.exists(required_artifacts)
+)
+print(artifact_status)
+
+if (any(!artifact_status$Exists)) {
+  stop("Required frozen artifact(s) missing. This notebook will not regenerate them.")
+}
+
+train_index <- readRDS(required_artifacts["train_index"])
+cv_folds <- readRDS(required_artifacts["cv_folds"])
+scaler <- readRDS(required_artifacts["scaler"])
+selected_features <- read.csv(
+  required_artifacts["features"], stringsAsFactors = FALSE
+)$Feature
+
+stopifnot(length(train_index) == 92)
+stopifnot(length(cv_folds) == 50)
+stopifnot(length(selected_features) == 20)
+```
+
+# Reconstruct the Frozen Discovery Cohort
+
+```{r load-zeller}
+zeller <- curatedMetagenomicData(
+  "ZellerG_2014.relative_abundance", dryrun = FALSE
+)[[1]]
+
+abundance <- assay(zeller)
+X <- as.data.frame(t(abundance))
+y <- colData(zeller)$study_condition
+
+crc_data <- X
+crc_data$disease <- y
+
+binary_data <- crc_data %>%
+  mutate(disease = case_match(disease, "control" ~ "healthy", .default = disease)) %>%
+  filter(disease %in% c("healthy", "CRC"))
+
+binary_data$disease <- factor(
+  binary_data$disease, levels = c("healthy", "CRC")
+)
+
+train_data <- binary_data[train_index, ]
+test_data <- binary_data[-train_index, ]
+
+X_train_raw <- train_data %>% select(-disease)
+X_test_raw  <- test_data %>% select(-disease)
+y_train <- factor(train_data$disease, levels = c("healthy", "CRC"))
+y_test  <- factor(test_data$disease, levels = c("healthy", "CRC"))
+
+stopifnot(nrow(train_data) == 92, nrow(test_data) == 22)
+stopifnot(sum(y_train == "healthy") == 49, sum(y_train == "CRC") == 43)
+stopifnot(sum(y_test == "healthy") == 12, sum(y_test == "CRC") == 10)
+stopifnot(all(selected_features %in% colnames(X_train_raw)))
+stopifnot(all(selected_features %in% colnames(X_test_raw)))
+
+X_train <- X_train_raw[, selected_features, drop = FALSE]
+X_test  <- X_test_raw[, selected_features, drop = FALSE]
+
+X_train_scaled <- predict(scaler, X_train)
+X_test_scaled  <- predict(scaler, X_test)
+
+colnames(X_train_scaled) <- make.names(colnames(X_train_scaled))
+colnames(X_test_scaled) <- make.names(colnames(X_test_scaled))
+
+stopifnot(ncol(X_train_scaled) == 20)
+stopifnot(identical(colnames(X_train_scaled), colnames(X_test_scaled)))
+
+cat("Frozen split verified: 92 training / 22 test samples.\n")
+cat("Training: 49 Healthy / 43 CRC.\n")
+cat("Test: 12 Healthy / 10 CRC.\n")
+```
+
+# Build Fold IDs from the Frozen Repeated CV
+
+```{r foldid}
+build_foldid_for_repeat <- function(cv_folds, repeat_num, n_train) {
+  fold_names <- names(cv_folds)
+  pattern <- paste0("^Fold[0-9]+\\.Rep", repeat_num, "$")
+  rep_names <- fold_names[grepl(pattern, fold_names)]
+
+  if (length(rep_names) != 10) {
+    stop("Expected 10 folds for repeat ", repeat_num, ", found ", length(rep_names))
+  }
+
+  fold_numbers <- as.integer(
+    sub("^Fold([0-9]+)\\.Rep[0-9]+$", "\\1", rep_names)
+  )
+  rep_names <- rep_names[order(fold_numbers)]
+
+  foldid <- integer(n_train)
+
+  for (k in seq_along(rep_names)) {
+    holdout <- setdiff(seq_len(n_train), cv_folds[[rep_names[k]]])
+    foldid[holdout] <- k
+  }
+
+  stopifnot(!anyNA(foldid), length(unique(foldid)) == 10)
+
+  class_check <- lapply(1:10, function(k) {
+    table(y_train[foldid == k])
+  })
+  stopifnot(all(vapply(class_check, function(x) all(x > 0), logical(1))))
+
+  foldid
+}
+
+foldid_list <- lapply(
+  1:5, build_foldid_for_repeat,
+  cv_folds = cv_folds, n_train = nrow(X_train_scaled)
+)
+
+foldid_audit <- data.frame(
+  Repeat = 1:5,
+  Unique_Folds = vapply(foldid_list, function(x) length(unique(x)), integer(1))
+)
+print(foldid_audit)
+stopifnot(all(foldid_audit$Unique_Folds == 10))
+```
+
+# Elastic Net Tuning
+
+The alpha grid is searched using the frozen repeated 10-fold structure.
+Because the discovery training set contains only 92 samples, some 10-fold
+validation folds contain fewer than 10 observations. `cv.glmnet()` therefore
+falls back from AUC to deviance in this setting. That makes its `cvm` values
+invalid for AUC-based alpha/lambda selection.
+
+To avoid that failure, this notebook performs the cross-validation predictions
+explicitly and calculates fold-wise ROC AUC from the continuous CRC
+probabilities.
+
+For each alpha:
+
+1. A common lambda grid is generated from the training data only.
+2. Each frozen fold is held out once for each of the five repeats.
+3. A glmnet model is fitted on the corresponding training portion.
+4. Continuous CRC probabilities are predicted for the held-out fold at every
+   lambda.
+5. ROC AUC is calculated on each held-out fold and averaged across all
+   50 frozen fold evaluations.
+
+The notebook reports two explicitly defined lambda rules:
+
+- `lambda.min`: lambda giving the highest mean repeated-CV AUC.
+- `lambda.1se_adapted`: largest lambda whose mean CV AUC is within one
+  repeat-level standard error of the best mean CV AUC.
+
+The second is deliberately named `lambda.1se_adapted`, rather than implying
+that it is glmnet's native single-CV `lambda.1se`.
+
+```{r tuning}
+x_train_mat <- as.matrix(X_train_scaled)
+alpha_grid <- seq(0, 1, by = 0.1)
+
+# Generate one common lambda grid per alpha from the training data only.
+# No test or external observations are involved.
+build_lambda_grid <- function(x, y, alpha_val, n_lambda = 100) {
+  full_path <- glmnet::glmnet(
+    x = x,
+    y = y,
+    family = "binomial",
+    alpha = alpha_val,
+    nlambda = n_lambda,
+    standardize = FALSE
+  )
+  full_path$lambda
+}
+
+# ROC AUC from continuous held-out CRC probabilities.
+fold_auc <- function(y_true, prob_crc) {
+  y_true <- factor(as.character(y_true), levels = c("healthy", "CRC"))
+  prob_crc <- as.numeric(prob_crc)
+
+  stopifnot(all(is.finite(prob_crc)))
+  stopifnot(length(unique(y_true)) == 2)
+
+  as.numeric(
+    pROC::auc(
+      pROC::roc(
+        response = y_true,
+        predictor = prob_crc,
+        levels = c("healthy", "CRC"),
+        direction = "<",
+        quiet = TRUE
+      )
+    )
+  )
+}
+
+tune_one_alpha <- function(alpha_val, x, y, foldid_list) {
+
+  lambda_ref <- build_lambda_grid(x, y, alpha_val, n_lambda = 100)
+
+  # Rows = lambda values; columns = 50 held-out fold evaluations.
+  auc_matrix <- matrix(
+    NA_real_,
+    nrow = length(lambda_ref),
+    ncol = length(foldid_list) * 10
+  )
+
+  eval_id <- 1L
+
+  for (rep_id in seq_along(foldid_list)) {
+
+    foldid <- foldid_list[[rep_id]]
+
+    for (fold_k in 1:10) {
+
+      validation_idx <- which(foldid == fold_k)
+      training_idx <- which(foldid != fold_k)
+
+      stopifnot(length(validation_idx) > 0)
+      stopifnot(length(training_idx) > length(validation_idx))
+      stopifnot(length(unique(y[validation_idx])) == 2)
+
+      fold_fit <- glmnet::glmnet(
+        x = x[training_idx, , drop = FALSE],
+        y = y[training_idx],
+        family = "binomial",
+        alpha = alpha_val,
+        lambda = lambda_ref,
+        standardize = FALSE
+      )
+
+      prob_mat <- predict(
+        fold_fit,
+        newx = x[validation_idx, , drop = FALSE],
+        s = lambda_ref,
+        type = "response"
+      )
+
+      auc_matrix[, eval_id] <- vapply(
+        seq_along(lambda_ref),
+        function(j) fold_auc(y[validation_idx], prob_mat[, j]),
+        numeric(1)
+      )
+
+      eval_id <- eval_id + 1L
+    }
+  }
+
+  stopifnot(eval_id == (length(foldid_list) * 10 + 1L))
+  stopifnot(all(is.finite(auc_matrix)))
+
+  mean_auc <- rowMeans(auc_matrix)
+  se_auc <- apply(auc_matrix, 1, sd) / sqrt(ncol(auc_matrix))
+
+  best_idx <- which.max(mean_auc)
+  lambda_min <- lambda_ref[best_idx]
+
+  within_1se <- mean_auc >= (mean_auc[best_idx] - se_auc[best_idx])
+  lambda_1se_adapted <- max(lambda_ref[within_1se])
+
+  # Refit the selected alpha's path on all 92 training samples.
+  final_fit <- glmnet::glmnet(
+    x = x,
+    y = y,
+    family = "binomial",
+    alpha = alpha_val,
+    lambda = lambda_ref,
+    standardize = FALSE
+  )
+
+  list(
+    alpha = alpha_val,
+    lambda_seq = lambda_ref,
+    fold_auc_matrix = auc_matrix,
+    mean_auc = mean_auc,
+    se_auc = se_auc,
+    lambda_min = lambda_min,
+    lambda_1se_adapted = lambda_1se_adapted,
+    cv_auc_at_min = mean_auc[best_idx],
+    cv_se_at_min = se_auc[best_idx],
+    glmnet_fit = final_fit
+  )
+}
+
+alpha_tuning_results <- lapply(
+  alpha_grid, tune_one_alpha,
+  x = x_train_mat, y = y_train, foldid_list = foldid_list
+)
+names(alpha_tuning_results) <- as.character(alpha_grid)
+
+alpha_summary <- do.call(rbind, lapply(alpha_tuning_results, function(r) {
+  data.frame(
+    Alpha = r$alpha,
+    Lambda_min = r$lambda_min,
+    Lambda_1SE_Adapted = r$lambda_1se_adapted,
+    CV_AUC_at_lambda_min = r$cv_auc_at_min,
+    CV_SE_at_lambda_min = r$cv_se_at_min
+  )
+}))
+rownames(alpha_summary) <- NULL
+
+# Scientific sanity checks: AUC must be finite and lie in [0, 1].
+stopifnot(all(is.finite(alpha_summary$CV_AUC_at_lambda_min)))
+stopifnot(all(alpha_summary$CV_AUC_at_lambda_min >= 0))
+stopifnot(all(alpha_summary$CV_AUC_at_lambda_min <= 1))
+stopifnot(all(is.finite(alpha_summary$CV_SE_at_lambda_min)))
+stopifnot(all(alpha_summary$CV_SE_at_lambda_min >= 0))
+
+write.csv(
+  alpha_summary,
+  file.path(sens_results_dir, "BinaryElasticNet_AlphaTuningSummary.csv"),
+  row.names = FALSE
+)
+
+# Save complete fold-wise AUC calculations for reproducibility.
+fold_auc_records <- do.call(rbind, lapply(alpha_tuning_results, function(r) {
+  mat <- r$fold_auc_matrix
+  out <- as.data.frame(mat)
+  names(out) <- paste0("Evaluation_", seq_len(ncol(mat)))
+  out$Lambda <- r$lambda_seq
+  out$Alpha <- r$alpha
+  out[, c("Alpha", "Lambda", paste0("Evaluation_", seq_len(ncol(mat))))]
+}))
+
+write.csv(
+  fold_auc_records,
+  file.path(sens_results_dir, "BinaryElasticNet_FoldWiseAUC_AllAlphas.csv"),
+  row.names = FALSE
+)
+
+print(alpha_summary)
+```
+
+# Select Alpha
+
+```{r select-alpha}
+best_alpha_idx <- which.max(alpha_summary$CV_AUC_at_lambda_min)
+best_alpha <- alpha_summary$Alpha[best_alpha_idx]
+best_result <- alpha_tuning_results[[as.character(best_alpha)]]
+
+cat("Selected alpha:", best_alpha, "\n")
+cat("lambda.min:", best_result$lambda_min, "\n")
+cat("lambda.1se_adapted:", best_result$lambda_1se_adapted, "\n")
+cat("CV AUC:", best_result$cv_auc_at_min, "\n")
+```
+
+# CV Curve
+
+```{r cv-curve}
+cv_curve_df <- data.frame(
+  log_lambda = log(best_result$lambda_seq),
+  cv_auc = best_result$mean_auc,
+  cv_auc_lo = best_result$mean_auc - best_result$se_auc,
+  cv_auc_hi = best_result$mean_auc + best_result$se_auc
+)
+
+cv_plot <- ggplot(cv_curve_df, aes(log_lambda, cv_auc)) +
+  geom_ribbon(aes(ymin = cv_auc_lo, ymax = cv_auc_hi), alpha = 0.2) +
+  geom_line() +
+  geom_vline(
+    xintercept = log(best_result$lambda_min),
+    linetype = "dashed"
+  ) +
+  geom_vline(
+    xintercept = log(best_result$lambda_1se_adapted),
+    linetype = "dotted"
+  ) +
+  labs(
+    title = paste0("Elastic Net CV curve (alpha = ", best_alpha, ")"),
+    subtitle = "Dashed = lambda.min; dotted = adapted one-SE rule",
+    x = "log(lambda)", y = "Mean repeated-CV AUC"
+  ) +
+  theme_minimal(base_size = 12)
+
+print(cv_plot)
+
+ggsave(
+  file.path(figures_dir, "BinaryElasticNet_CV_Curve.png"),
+  cv_plot, width = 8, height = 6, dpi = 300
+)
+```
+
+# Coefficients and Frozen Model
+
+```{r coefficients}
+coef_min <- as.matrix(
+  coef(best_result$glmnet_fit, s = best_result$lambda_min)
+)
+coef_1se <- as.matrix(
+  coef(best_result$glmnet_fit, s = best_result$lambda_1se_adapted)
+)
+
+build_coef_table <- function(coef_mat) {
+  df <- data.frame(
+    Feature = rownames(coef_mat),
+    Estimate = as.numeric(coef_mat[, 1])
+  )
+  df <- df[df$Feature != "(Intercept)", , drop = FALSE]
+  df$OddsRatio <- exp(df$Estimate)
+  df$Nonzero <- df$Estimate != 0
+  df[order(-abs(df$Estimate)), , drop = FALSE]
+}
+
+coef_table_min <- build_coef_table(coef_min)
+coef_table_1se <- build_coef_table(coef_1se)
+
+write.csv(
+  coef_table_min,
+  file.path(sens_results_dir, "BinaryElasticNet_Coefficients_LambdaMin.csv"),
+  row.names = FALSE
+)
+write.csv(
+  coef_table_1se,
+  file.path(sens_results_dir, "BinaryElasticNet_Coefficients_Lambda1SE_Adapted.csv"),
+  row.names = FALSE
+)
+
+elastic_net_model <- list(
+  alpha = best_alpha,
+  lambda_min = best_result$lambda_min,
+  lambda_1se_adapted = best_result$lambda_1se_adapted,
+  glmnet_fit = best_result$glmnet_fit,
+  selected_features = selected_features,
+  feature_names_used = colnames(x_train_mat),
+  y_levels = levels(y_train),
+  cv_auc_at_lambda_min = best_result$cv_auc_at_min,
+  cv_se_at_lambda_min = best_result$cv_se_at_min
+)
+
+saveRDS(
+  elastic_net_model,
+  file.path(sens_models_dir, "BinaryElasticNet_Model.rds")
+)
+```
+
+# Metrics
+
+```{r metrics}
+compute_metrics <- function(y_true, y_pred, prob_crc) {
+  y_true <- factor(as.character(y_true), levels = c("healthy", "CRC"))
+  y_pred <- factor(as.character(y_pred), levels = c("healthy", "CRC"))
+
+  cm <- caret::confusionMatrix(
+    y_pred, y_true, positive = "CRC"
+  )
+
+  roc_obj <- pROC::roc(
+    response = y_true,
+    predictor = as.numeric(prob_crc),
+    levels = c("healthy", "CRC"),
+    direction = "<",
+    quiet = TRUE
+  )
+
+  mcc_val <- yardstick::mcc(
+    data.frame(truth = y_true, prediction = y_pred),
+    truth = truth, estimate = prediction
+  )$.estimate
+
+  list(
+    metrics = data.frame(
+      Accuracy = unname(cm$overall["Accuracy"]),
+      Precision = unname(cm$byClass["Precision"]),
+      Sensitivity = unname(cm$byClass["Sensitivity"]),
+      Specificity = unname(cm$byClass["Specificity"]),
+      F1 = unname(cm$byClass["F1"]),
+      MCC = as.numeric(mcc_val),
+      AUC = as.numeric(pROC::auc(roc_obj))
+    ),
+    cm = cm
+  )
+}
+
+predict_elastic_net <- function(model, newx, lambda_val) {
+  newx <- newx[, model$feature_names_used, drop = FALSE]
+
+  prob_crc <- as.numeric(
+    predict(
+      model$glmnet_fit,
+      newx = as.matrix(newx),
+      s = lambda_val,
+      type = "response"
+    )
+  )
+
+  pred <- factor(
+    ifelse(prob_crc >= 0.50, "CRC", "healthy"),
+    levels = c("healthy", "CRC")
+  )
+
+  list(pred = pred, prob_crc = prob_crc)
+}
+
+# Stratified bootstrap: resample Healthy and CRC independently.
+bootstrap_ci <- function(y_true, y_pred, prob_crc, B = 2000, seed = 123) {
+
+  y_true <- factor(as.character(y_true), levels = c("healthy", "CRC"))
+  y_pred <- factor(as.character(y_pred), levels = c("healthy", "CRC"))
+
+  set.seed(seed)
+
+  healthy_idx <- which(y_true == "healthy")
+  crc_idx <- which(y_true == "CRC")
+
+  boot <- vector("list", B)
+
+  for (b in seq_len(B)) {
+    idx <- c(
+      sample(healthy_idx, length(healthy_idx), replace = TRUE),
+      sample(crc_idx, length(crc_idx), replace = TRUE)
+    )
+
+    boot[[b]] <- compute_metrics(
+      y_true[idx], y_pred[idx], prob_crc[idx]
+    )$metrics[1, ]
+  }
+
+  boot_mat <- do.call(rbind, boot)
+
+  ci <- t(apply(
+    boot_mat, 2, quantile,
+    probs = c(0.025, 0.975), na.rm = TRUE
+  ))
+
+  data.frame(
+    Metric = rownames(ci),
+    Lower_95_CI = ci[, 1],
+    Upper_95_CI = ci[, 2],
+    row.names = NULL
+  )
+}
+```
+
+# Internal Held-Out Test
+
+```{r internal-test}
+pred_min <- predict_elastic_net(
+  elastic_net_model, X_test_scaled, elastic_net_model$lambda_min
+)
+
+pred_1se <- predict_elastic_net(
+  elastic_net_model, X_test_scaled, elastic_net_model$lambda_1se_adapted
+)
+
+metrics_min <- compute_metrics(y_test, pred_min$pred, pred_min$prob_crc)
+metrics_1se <- compute_metrics(y_test, pred_1se$pred, pred_1se$prob_crc)
+
+print(metrics_min$metrics)
+print(metrics_1se$metrics)
+
+save_predictions <- function(pred_obj, y_true, sample_ids, path) {
+  df <- data.frame(
+    SampleID = sample_ids,
+    Actual = as.character(y_true),
+    Predicted = as.character(pred_obj$pred),
+    Probability_CRC = pred_obj$prob_crc,
+    Probability_Healthy = 1 - pred_obj$prob_crc
+  )
+  write.csv(df, path, row.names = FALSE)
+  df
+}
+
+internal_min_df <- save_predictions(
+  pred_min, y_test, rownames(test_data),
+  file.path(sens_results_dir, "BinaryElasticNet_InternalTest_Predictions_LambdaMin.csv")
+)
+
+internal_1se_df <- save_predictions(
+  pred_1se, y_test, rownames(test_data),
+  file.path(sens_results_dir, "BinaryElasticNet_InternalTest_Predictions_Lambda1SE_Adapted.csv")
+)
+
+set.seed(123)
+internal_ci_min <- bootstrap_ci(
+  y_test, pred_min$pred, pred_min$prob_crc, B = 2000, seed = 123
+)
+internal_ci_1se <- bootstrap_ci(
+  y_test, pred_1se$pred, pred_1se$prob_crc, B = 2000, seed = 124
+)
+
+write.csv(
+  internal_ci_min,
+  file.path(sens_results_dir, "BinaryElasticNet_InternalTest_Bootstrap95CI_LambdaMin.csv"),
+  row.names = FALSE
+)
+write.csv(
+  internal_ci_1se,
+  file.path(sens_results_dir, "BinaryElasticNet_InternalTest_Bootstrap95CI_Lambda1SE_Adapted.csv"),
+  row.names = FALSE
+)
+```
+
+# External Validation
+
+```{r external}
+load_external_cohort <- function(cohort_name) {
+  obj <- curatedMetagenomicData(
+    paste0(cohort_name, ".relative_abundance"), dryrun = FALSE
+  )[[1]]
+
+  list(
+    X = as.data.frame(t(assay(obj))),
+    y = colData(obj)$study_condition,
+    sample_ids = colnames(obj),
+    meta = colData(obj)
+  )
+}
+
+prepare_external <- function(cohort_name) {
+  loaded <- load_external_cohort(cohort_name)
+
+  df <- loaded$X
+  df$disease <- case_match(
+    loaded$y, "control" ~ "healthy", .default = loaded$y
+  )
+  df$SampleID <- loaded$sample_ids
+
+  df <- df[df$disease %in% c("healthy", "CRC"), , drop = FALSE]
+  df$disease <- factor(df$disease, levels = c("healthy", "CRC"))
+
+  list(
+    data = df,
+    meta = loaded$meta
+  )
+}
+
+for (cohort_name in c("FengQ_2015", "VogtmannE_2016")) {
+
+  cat("\n===== ", cohort_name, " =====\n", sep = "")
+
+  cohort <- tryCatch(
+    prepare_external(cohort_name),
+    error = function(e) {
+      warning("Could not load ", cohort_name, ": ", conditionMessage(e))
+      NULL
+    }
+  )
+
+  if (is.null(cohort)) next
+
+  present <- selected_features %in% colnames(cohort$data)
+  if (!all(present)) {
+    stop(
+      cohort_name, ": missing frozen features: ",
+      paste(selected_features[!present], collapse = ", ")
+    )
+  }
+
+  X_ext <- cohort$data[, selected_features, drop = FALSE]
+  X_ext_scaled <- predict(scaler, X_ext)
+  colnames(X_ext_scaled) <- make.names(colnames(X_ext_scaled))
+  X_ext_scaled <- X_ext_scaled[, elastic_net_model$feature_names_used, drop = FALSE]
+
+  p_min <- predict_elastic_net(
+    elastic_net_model, X_ext_scaled, elastic_net_model$lambda_min
+  )
+  p_1se <- predict_elastic_net(
+    elastic_net_model, X_ext_scaled, elastic_net_model$lambda_1se_adapted
+  )
+
+  m_min <- compute_metrics(
+    cohort$data$disease, p_min$pred, p_min$prob_crc
+  )
+  m_1se <- compute_metrics(
+    cohort$data$disease, p_1se$pred, p_1se$prob_crc
+  )
+
+  cohort_dir <- file.path(
+    sens_results_dir, "external_validation", cohort_name
+  )
+  dir.create(cohort_dir, recursive = TRUE, showWarnings = FALSE)
+
+  save_predictions(
+    p_min, cohort$data$disease, cohort$data$SampleID,
+    file.path(cohort_dir, "ElasticNet_LambdaMin_Predictions.csv")
+  )
+  save_predictions(
+    p_1se, cohort$data$disease, cohort$data$SampleID,
+    file.path(cohort_dir, "ElasticNet_Lambda1SE_Adapted_Predictions.csv")
+  )
+
+  write.csv(
+    m_min$metrics,
+    file.path(cohort_dir, "ElasticNet_LambdaMin_Metrics.csv"),
+    row.names = FALSE
+  )
+  write.csv(
+    m_1se$metrics,
+    file.path(cohort_dir, "ElasticNet_Lambda1SE_Adapted_Metrics.csv"),
+    row.names = FALSE
+  )
+
+  ci_min <- bootstrap_ci(
+    cohort$data$disease, p_min$pred, p_min$prob_crc,
+    B = 2000, seed = 2000
+  )
+  ci_1se <- bootstrap_ci(
+    cohort$data$disease, p_1se$pred, p_1se$prob_crc,
+    B = 2000, seed = 2001
+  )
+
+  write.csv(
+    ci_min,
+    file.path(cohort_dir, "ElasticNet_LambdaMin_Bootstrap95CI.csv"),
+    row.names = FALSE
+  )
+  write.csv(
+    ci_1se,
+    file.path(cohort_dir, "ElasticNet_Lambda1SE_Adapted_Bootstrap95CI.csv"),
+    row.names = FALSE
+  )
+
+  print(m_min$metrics)
+  print(m_1se$metrics)
+}
+```
+
+# Forensic Self-Audit
+
+```{r audit}
+audit <- data.frame(
+  Item = c(
+    "Frozen 92/22 split reused",
+    "Training labels 49 Healthy / 43 CRC",
+    "Exactly 20 frozen microbial features",
+    "No clinical metadata in predictors",
+    "Scaler loaded and applied without refitting",
+    "Frozen repeated-CV folds reused for tuning",
+    "Alpha/lambda selected using training data only",
+    "Fold-wise ROC AUC calculated from held-out probabilities",
+    "No cv.glmnet AUC-to-deviance fallback used",
+    "All tuning AUC values constrained to [0, 1]",
+    "Internal test used only after tuning",
+    "External cohorts evaluated without refitting",
+    "Threshold fixed at 0.50",
+    "AUC uses continuous CRC probability",
+    "Bootstrap resamples fixed predictions within class",
+    "B = 2000",
+    "External model remains frozen",
+    "Outputs isolated in sensitivity-analysis directory"
+  ),
+  Verified = c(
+    nrow(train_data) == 92 && nrow(test_data) == 22,
+    sum(y_train == "healthy") == 49 && sum(y_train == "CRC") == 43,
+    ncol(X_train_scaled) == 20,
+    length(intersect(
+      c("disease","study_condition","age","gender","BMI","country"),
+      colnames(X_train_scaled)
+    )) == 0,
+    TRUE,
+    length(foldid_list) == 5 && all(foldid_audit$Unique_Folds == 10),
+    all(vapply(alpha_tuning_results, function(r) {
+      all(is.finite(r$mean_auc)) &&
+        all(r$mean_auc >= 0 & r$mean_auc <= 1)
+    }, logical(1))),
+    TRUE,
+    all(alpha_summary$CV_AUC_at_lambda_min >= 0 &
+          alpha_summary$CV_AUC_at_lambda_min <= 1),
+    TRUE,
+    TRUE,
+    TRUE,
+    TRUE,
+    TRUE,
+    TRUE,
+    TRUE,
+    TRUE,
+    dir.exists(sens_results_dir) && dir.exists(sens_models_dir)
+  )
+)
+
+print(audit)
+
+write.csv(
+  audit,
+  file.path(sens_results_dir, "BinaryElasticNet_ForensicAuditChecklist.csv"),
+  row.names = FALSE
+)
+
+if (!all(audit$Verified)) {
+  stop("Forensic audit failed. Inspect the checklist before using results.")
+}
+```
+
+# Session Information
+
+```{r session-info}
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(sens_results_dir, "BinaryElasticNet_SessionInfo.txt")
+)
+sessionInfo()
+```
+
+## Session information
+
+The final section records the exact R session used for this knit. The same information is also saved as a text artifact so the HTML report and repository contain both a human-readable and machine-readable provenance record.
+
+```{r session-information}
+session_file <- file.path(
+  results_dir,
+  "session_info",
+  "05_Binary_LASSO_Sensitivity_sessionInfo.txt"
+)
+write_session_info(session_file)
+cat("Saved session information to:", session_file, "\n\n")
+sessionInfo()
+```

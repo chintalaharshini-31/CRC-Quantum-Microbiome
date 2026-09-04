@@ -1,0 +1,31 @@
+==========================================================
+QSVC DATA EXPORT LOG
+==========================================================
+Export date: 2026-09-04 22:35:11
+Random seed: 1910
+
+CLASSIFICATION TASK
+Healthy vs CRC
+
+DATASET
+ZellerG_2014.relative_abundance
+
+SHARED TRAIN-TEST SPLIT
+Split file: C:/CRC/CRC_Quantum_Microbiome_Githb/CRC_Quantum_Microbiome_GitHub_RMD/02 Classical ML/models/BinaryClass_Train_Index.rds
+Training samples: 92
+Testing samples: 22
+
+FEATURE SELECTION
+NZV features removed: 380
+Final Boruta-selected features: 20
+
+TRAINING CLASS COUNTS
+healthy = 49, CRC = 43
+
+TESTING CLASS COUNTS
+healthy = 12, CRC = 10
+
+OUTPUT FILES
+C:/CRC/CRC_Quantum_Microbiome_Githb/CRC_Quantum_Microbiome_GitHub_RMD/03 Quantum_ML/05 QSVC/data/QSVC_Train_Data.csv
+C:/CRC/CRC_Quantum_Microbiome_Githb/CRC_Quantum_Microbiome_GitHub_RMD/03 Quantum_ML/05 QSVC/data/QSVC_Test_Data.csv
+C:/CRC/CRC_Quantum_Microbiome_Githb/CRC_Quantum_Microbiome_GitHub_RMD/03 Quantum_ML/05 QSVC/data/QSVC_Feature_Name_Map.csv

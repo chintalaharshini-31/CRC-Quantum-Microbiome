@@ -1,0 +1,16 @@
+{
+  "n_qubits": 8,
+  "reps": 1,
+  "entanglement": "linear",
+  "num_parameters": 8,
+  "selected_features_syntactic": [
+    "k__Bacteria.p__Firmicutes.c__Clostridia.o__Clostridiales.f__Peptostreptococcaceae.g__Peptostreptococcus.s__Peptostreptococcus_stomatis",
+    "k__Bacteria.p__Firmicutes.c__Bacilli.o__Lactobacillales.f__Streptococcaceae.g__Streptococcus.s__Streptococcus_salivarius",
+    "k__Bacteria.p__Firmicutes.c__Tissierellia.o__Tissierellales.f__Peptoniphilaceae.g__Parvimonas.s__Parvimonas_micra",
+    "k__Bacteria.p__Firmicutes.c__Clostridia.o__Clostridiales.f__Ruminococcaceae.g__Ruthenibacterium.s__Ruthenibacterium_lactatiformans",
+    "k__Bacteria.p__Firmicutes.c__Clostridia.o__Clostridiales.f__Lachnospiraceae.g__Anaerostipes.s__Anaerostipes_hadrus",
+    "k__Bacteria.p__Proteobacteria.c__Deltaproteobacteria.o__Desulfovibrionales.f__Desulfovibrionaceae.g__Bilophila.s__Bilophila_wadsworthia",
+    "k__Bacteria.p__Bacteroidetes.c__Bacteroidia.o__Bacteroidales.f__Bacteroidaceae.g__Bacteroides.s__Bacteroides_uniformis",
+    "k__Bacteria.p__Firmicutes.c__Clostridia.o__Clostridiales.f__Oscillospiraceae.g__Oscillibacter.s__Oscillibacter_sp_CAG_241"
+  ]
+}

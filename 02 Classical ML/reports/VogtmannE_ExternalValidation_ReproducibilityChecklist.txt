@@ -1,0 +1,22 @@
+VogtmannE_2016 External Validation Reproducibility Checklist
+VogtmannE_2016 loaded : PASS
+Healthy and CRC both present : PASS
+Sample counts recorded : PASS
+Study independence documented : PASS
+All required features found (per model) : PASS
+Feature order verified before prediction : PASS
+Frozen scalers loaded (not refit) : PASS
+Frozen LR model loaded : PASS
+Frozen RF model loaded : PASS
+Frozen SVM model loaded : PASS
+Frozen XGBoost model loaded : PASS
+No model retraining occurred : PASS
+Predictions saved (all 4 models) : PASS
+Metrics saved (all 4 models) : PASS
+Confusion matrices saved (all 4 models) : PASS
+ROC coordinates saved (all 4 models) : PASS
+Figures saved : PASS
+Bootstrap 95% CI table saved : PASS
+VogtmannE master metrics saved : PASS
+Three-way comparison table saved : PASS
+Session information saved : PASS

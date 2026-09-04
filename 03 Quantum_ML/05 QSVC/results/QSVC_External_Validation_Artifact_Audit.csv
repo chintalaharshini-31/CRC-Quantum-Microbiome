@@ -1,0 +1,13 @@
+Path,Exists,Size_bytes
+C:\CRC\CRC_Quantum_Microbiome_Githb\CRC_Quantum_Microbiome_GitHub_RMD\03 Quantum_ML\05 QSVC\data\QSVC_Train_Data.csv,True,39748
+C:\CRC\CRC_Quantum_Microbiome_Githb\CRC_Quantum_Microbiome_GitHub_RMD\03 Quantum_ML\05 QSVC\data\QSVC_Test_Data.csv,True,11447
+C:\CRC\CRC_Quantum_Microbiome_Githb\CRC_Quantum_Microbiome_GitHub_RMD\03 Quantum_ML\05 QSVC\data\QSVC_Feature_Name_Map.csv,True,5084
+C:\CRC\CRC_Quantum_Microbiome_Githb\CRC_Quantum_Microbiome_GitHub_RMD\03 Quantum_ML\05 QSVC\results\QSVC_Selected_Top8_Features.csv,True,1214
+C:\CRC\CRC_Quantum_Microbiome_Githb\CRC_Quantum_Microbiome_GitHub_RMD\03 Quantum_ML\05 QSVC\results\QSVC_Test_Metrics.csv,True,186
+C:\CRC\CRC_Quantum_Microbiome_Githb\CRC_Quantum_Microbiome_GitHub_RMD\03 Quantum_ML\05 QSVC\results\QSVC_vs_ClassicalSVM_Comparison.csv,True,299
+C:\CRC\CRC_Quantum_Microbiome_Githb\CRC_Quantum_Microbiome_GitHub_RMD\03 Quantum_ML\05 QSVC\results\QSVC_vs_LogisticRegression_8Feature_Comparison.csv,True,307
+C:\CRC\CRC_Quantum_Microbiome_Githb\CRC_Quantum_Microbiome_GitHub_RMD\03 Quantum_ML\05 QSVC\models\QSVC_AngleScaler.joblib,True,2247
+C:\CRC\CRC_Quantum_Microbiome_Githb\CRC_Quantum_Microbiome_GitHub_RMD\03 Quantum_ML\05 QSVC\models\QSVC_Model.joblib,True,28695
+C:\CRC\CRC_Quantum_Microbiome_Githb\CRC_Quantum_Microbiome_GitHub_RMD\03 Quantum_ML\05 QSVC\models\QSVC_ClassicalSVM_Baseline.joblib,True,7499
+C:\CRC\CRC_Quantum_Microbiome_Githb\CRC_Quantum_Microbiome_GitHub_RMD\03 Quantum_ML\05 QSVC\data\QSVC_External_FengQ_2015_Data.csv,True,44717
+C:\CRC\CRC_Quantum_Microbiome_Githb\CRC_Quantum_Microbiome_GitHub_RMD\03 Quantum_ML\05 QSVC\data\QSVC_External_VogtmannE_2016_Data.csv,True,44969

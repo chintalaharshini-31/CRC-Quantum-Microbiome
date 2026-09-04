@@ -1,0 +1,19 @@
+"Item","Verified"
+"Frozen 92/22 split reused",TRUE
+"Training labels 49 Healthy / 43 CRC",TRUE
+"Exactly 20 frozen microbial features",TRUE
+"No clinical metadata in predictors",TRUE
+"Scaler loaded and applied without refitting",TRUE
+"Frozen repeated-CV folds reused for tuning",TRUE
+"Alpha/lambda selected using training data only",TRUE
+"Fold-wise ROC AUC calculated from held-out probabilities",TRUE
+"No cv.glmnet AUC-to-deviance fallback used",TRUE
+"All tuning AUC values constrained to [0, 1]",TRUE
+"Internal test used only after tuning",TRUE
+"External cohorts evaluated without refitting",TRUE
+"Threshold fixed at 0.50",TRUE
+"AUC uses continuous CRC probability",TRUE
+"Bootstrap resamples fixed predictions within class",TRUE
+"B = 2000",TRUE
+"External model remains frozen",TRUE
+"Outputs isolated in sensitivity-analysis directory",TRUE

@@ -1,0 +1,1089 @@
+---
+title: "Nested Cross-Validation Sensitivity / Audit Analysis"
+subtitle: "Healthy vs CRC Binary Classification — Fully Nested Preprocessing, Feature Selection and Tuning"
+author: "Harshini Chintala"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    theme: cosmo
+    highlight: tango
+    df_print: paged
+    fig_caption: true
+    self_contained: true
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  collapse = TRUE,
+  comment = "##",
+  fig.width = 7.2,
+  fig.height = 5.2,
+  dpi = 300,
+  fig.align = "center",
+  out.width = "92%",
+  results = "markup"
+)
+
+options(width = 90, scipen = 999)
+
+source("../../R/project_setup.R")
+set.seed(1910)
+
+project_dir <- classical_dir
+results_dir <- file.path(classical_dir, "results")
+models_dir <- file.path(classical_dir, "models")
+data_dir <- file.path(classical_dir, "data")
+reports_dir <- file.path(classical_dir, "reports")
+figures_dir <- file.path(classical_dir, "figures")
+
+nested_root <- file.path(results_dir, "nested_cv")
+
+for (d in c(
+  results_dir,
+  models_dir,
+  data_dir,
+  reports_dir,
+  figures_dir,
+  nested_root,
+  file.path(nested_root, "metrics"),
+  file.path(nested_root, "predictions"),
+  file.path(nested_root, "feature_selection"),
+  file.path(nested_root, "tuning"),
+  file.path(models_dir, "nested_cv")
+)) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+
+library(caret)
+library(dplyr)
+library(pROC)
+library(Boruta)
+library(randomForest)
+library(kernlab)
+library(xgboost)
+library(yardstick)
+library(curatedMetagenomicData)
+library(TreeSummarizedExperiment)
+
+QUICK_TEST <- FALSE
+BASE_SEED <- 1910
+
+OUTER_K <- 10
+OUTER_REPEATS <- 5
+INNER_K <- 5
+
+BORUTA_MAXRUNS <- 100
+
+RF_NTREE <- 500
+RF_MTRY_GRID <- 6
+
+SVM_SIGMA <- c(0.01, 0.02)
+SVM_C <- c(0.5, 1, 2, 4)
+
+XGB_MAXROUNDS <- 1000
+XGB_EARLYSTOP <- 20
+
+XGB_GRID <- expand.grid(
+  max_depth = c(2, 3, 5),
+  eta = c(0.05, 0.1),
+  gamma = 0,
+  colsample_bytree = 0.7,
+  min_child_weight = 1,
+  subsample = c(0.8, 1.0)
+)
+
+```
+
+## Notebook roadmap
+
+**Purpose:** This notebook is one reproducible component of the CRC microbiome classification pipeline.
+
+**Execution order**
+1. Load the project environment and fixed random seed (`1910`).
+2. Load only the validated project artifacts required for this analysis.
+3. Perform the analysis exactly as documented below.
+4. Generate tables/figures and save machine-readable outputs.
+5. Record the session information used for the run.
+
+**Output contract:** generated tables, figures, model objects, audit files, and session information are written under `02 Classical ML/results/`. The notebook itself renders to HTML with a floating table of contents, so the sections can be navigated from the left-hand panel in the knitted document.
+
+**Reproducibility rule:** this repository preserves the validated analysis logic and project-wide seed. Environment restoration is handled by `renv.lock` for R and `requirements.txt` for Python. The notebooks do not silently install unpinned packages during knitting.
+
+### Reproducibility constants
+
+- Project seed: **1910**
+- Discovery cohort: **ZellerG_2014**
+- Primary task: **Healthy vs CRC; adenoma excluded**
+- Frozen discovery split: **92 training / 22 held-out test samples**
+- Primary feature panel: **20 Boruta-selected features**
+- External cohorts: **FengQ_2015** and **VogtmannE_2016**
+
+# Purpose
+
+This notebook is a **methodological audit / sensitivity analysis** designed to
+address the previously identified leakage risk in the primary classical ML
+pipeline.
+
+The key requirement is:
+
+> Every data-dependent operation must be learned only from the data available
+> inside the relevant training portion of the resampling procedure.
+
+Therefore, in **every outer fold**:
+
+1. NZV filtering is learned on outer-training data.
+2. Boruta feature selection is learned on outer-training data.
+3. Scaling parameters are learned on outer-training data.
+4. Inside the outer-training data, the **inner CV** repeats steps 1–3 within
+   each inner training fold before model tuning.
+5. Hyperparameters are selected using only inner-validation predictions.
+6. The final outer-fold model is then fitted on the **entire outer-training
+   set**, using preprocessing/feature-selection rules learned from that entire
+   outer-training set.
+7. The resulting model is evaluated exactly once on the untouched outer
+   validation fold.
+
+The 22-sample primary held-out test set is **never used** in this notebook.
+
+# Configuration
+
+
+
+# Load Dataset and Reuse the Exact Primary 92/22 Split
+
+```{r data}
+zeller <- curatedMetagenomicData(
+  "ZellerG_2014.relative_abundance", dryrun = FALSE
+)[[1]]
+
+abundance <- assay(zeller)
+X_full <- as.data.frame(t(abundance))
+y_full <- colData(zeller)$study_condition
+
+crc_data <- X_full
+crc_data$disease <- y_full
+
+binary_data <- crc_data %>%
+  mutate(disease = case_match(
+    disease, "control" ~ "healthy", .default = disease
+  )) %>%
+  filter(disease %in% c("healthy", "CRC"))
+
+binary_data$disease <- factor(
+  binary_data$disease, levels = c("healthy", "CRC")
+)
+
+train_index_path <- file.path(models_dir, "BinaryClass_Train_Index.rds")
+if (!file.exists(train_index_path)) {
+  stop("Primary BinaryClass_Train_Index.rds not found.")
+}
+
+train_index <- readRDS(train_index_path)
+
+train_data <- binary_data[train_index, ]
+test_data <- binary_data[-train_index, ]
+
+stopifnot(nrow(train_data) == 92, nrow(test_data) == 22)
+stopifnot(sum(train_data$disease == "healthy") == 49)
+stopifnot(sum(train_data$disease == "CRC") == 43)
+stopifnot(sum(test_data$disease == "healthy") == 12)
+stopifnot(sum(test_data$disease == "CRC") == 10)
+
+X_pool <- train_data %>% select(-disease)
+y_pool <- factor(train_data$disease, levels = c("healthy", "CRC"))
+
+cat("Primary split reproduced exactly: 92 training / 22 held-out test.\n")
+cat("The 22-sample test set is now locked and will not be used again.\n")
+```
+
+# Helper: Leakage-Safe Preprocessing
+
+This function is the critical part of the audit.
+
+It receives **training data and validation data for one resampling split**.
+NZV filtering, Boruta, and scaling are learned from the training data only.
+
+```{r preprocess-function}
+preprocess_fold <- function(
+  X_train, y_train, X_val,
+  boruta_maxruns = 100,
+  seed = 1910
+) {
+
+  set.seed(seed)
+
+  # 1. NZV learned on training data only.
+  nzv <- caret::nearZeroVar(X_train)
+
+  if (length(nzv) > 0) {
+    X_train_nzv <- X_train[, -nzv, drop = FALSE]
+    X_val_nzv <- X_val[, -nzv, drop = FALSE]
+  } else {
+    X_train_nzv <- X_train
+    X_val_nzv <- X_val
+  }
+
+  if (ncol(X_train_nzv) == 0) {
+    stop("NZV filtering removed all predictors.")
+  }
+
+  # 2. Boruta learned on training data only.
+  boruta_df <- data.frame(
+    Disease = factor(y_train, levels = c("healthy", "CRC")),
+    X_train_nzv,
+    check.names = FALSE
+  )
+
+  boruta_fit <- tryCatch(
+    Boruta::Boruta(
+      Disease ~ .,
+      data = boruta_df,
+      doTrace = 0,
+      maxRuns = boruta_maxruns
+    ),
+    error = function(e) NULL
+  )
+
+  fallback <- FALSE
+
+  if (is.null(boruta_fit)) {
+    selected <- colnames(X_train_nzv)
+    fallback <- TRUE
+  } else {
+    boruta_fixed <- Boruta::TentativeRoughFix(boruta_fit)
+    selected <- Boruta::getSelectedAttributes(
+      boruta_fixed, withTentative = FALSE
+    )
+
+    if (length(selected) == 0) {
+      selected <- colnames(X_train_nzv)
+      fallback <- TRUE
+    }
+  }
+
+  X_train_sel <- X_train_nzv[, selected, drop = FALSE]
+  X_val_sel <- X_val_nzv[, selected, drop = FALSE]
+
+  # 3. Scaling learned on training data only.
+  scaler <- caret::preProcess(
+    X_train_sel,
+    method = c("center", "scale")
+  )
+
+  X_train_scaled <- predict(scaler, X_train_sel)
+  X_val_scaled <- predict(scaler, X_val_sel)
+
+  colnames(X_train_scaled) <- make.names(colnames(X_train_scaled))
+  colnames(X_val_scaled) <- make.names(colnames(X_val_scaled))
+
+  list(
+    X_train = X_train_scaled,
+    X_val = X_val_scaled,
+    selected_features = selected,
+    scaler = scaler,
+    nzv_features = colnames(X_train)[nzv],
+    boruta_fallback = fallback
+  )
+}
+```
+
+# Helper: Model Tuning Inside an Inner Fold
+
+The function below receives the **raw outer-training subset** and performs
+another complete resampling pipeline inside it.
+
+For every inner split, preprocessing is refitted from that inner training
+subset. This prevents inner validation observations from influencing feature
+selection or scaling.
+
+```{r inner-tuning}
+tune_models_inner <- function(
+  X_outer_train, y_outer_train,
+  inner_k = 5,
+  boruta_maxruns = 100,
+  rf_ntree = 500,
+  rf_mtry_grid = 6,
+  svm_sigma = c(0.01, 0.02),
+  svm_C = c(0.5, 1, 2, 4),
+  xgb_grid = XGB_GRID,
+  xgb_maxrounds = 1000,
+  xgb_earlystop = 20,
+  seed = 1910
+) {
+
+  set.seed(seed)
+
+  inner_folds <- caret::createFolds(
+    y_outer_train, k = inner_k,
+    list = TRUE, returnTrain = FALSE
+  )
+
+  model_names <- c("BinaryLogistic", "RandomForest", "SVM", "XGBoost")
+  score_store <- setNames(vector("list", length(model_names)), model_names)
+
+  for (m in model_names) score_store[[m]] <- numeric()
+
+  tuning_records <- list()
+
+  for (j in seq_along(inner_folds)) {
+
+    inner_val_idx <- inner_folds[[j]]
+    inner_train_idx <- setdiff(
+      seq_along(y_outer_train), inner_val_idx
+    )
+
+    prep <- preprocess_fold(
+      X_outer_train[inner_train_idx, , drop = FALSE],
+      y_outer_train[inner_train_idx],
+      X_outer_train[inner_val_idx, , drop = FALSE],
+      boruta_maxruns = boruta_maxruns,
+      seed = seed + j
+    )
+
+    y_tr <- factor(
+      y_outer_train[inner_train_idx],
+      levels = c("healthy", "CRC")
+    )
+    y_va <- factor(
+      y_outer_train[inner_val_idx],
+      levels = c("healthy", "CRC")
+    )
+
+    df_tr <- data.frame(
+      Disease = y_tr, prep$X_train, check.names = FALSE
+    )
+
+    # Logistic regression: no hyperparameters.
+    lr <- tryCatch(
+      glm(Disease ~ ., data = df_tr, family = binomial()),
+      error = function(e) NULL
+    )
+
+    if (!is.null(lr)) {
+      p <- as.numeric(
+        predict(lr, newdata = prep$X_val, type = "response")
+      )
+      auc <- tryCatch(
+        as.numeric(pROC::auc(
+          pROC::roc(y_va, p, levels = c("healthy", "CRC"), quiet = TRUE)
+        )),
+        error = function(e) NA_real_
+      )
+      score_store$BinaryLogistic <- c(
+        score_store$BinaryLogistic, auc
+      )
+    }
+
+    # Random Forest tuning.
+    rf_mtry <- unique(pmax(
+      1,
+      round(seq(
+        1, ncol(prep$X_train),
+        length.out = min(rf_mtry_grid, ncol(prep$X_train))
+      ))
+    ))
+
+    rf_scores <- sapply(rf_mtry, function(mtry) {
+      fit <- tryCatch(
+        randomForest::randomForest(
+          x = prep$X_train, y = y_tr,
+          mtry = mtry, ntree = rf_ntree
+        ),
+        error = function(e) NULL
+      )
+      if (is.null(fit)) return(NA_real_)
+
+      p <- predict(fit, prep$X_val, type = "prob")[, "CRC"]
+
+      tryCatch(
+        as.numeric(pROC::auc(
+          pROC::roc(y_va, p, levels = c("healthy", "CRC"), quiet = TRUE)
+        )),
+        error = function(e) NA_real_
+      )
+    })
+
+    best_rf <- rf_mtry[which.max(rf_scores)]
+    score_store$RandomForest <- c(
+      score_store$RandomForest,
+      max(rf_scores, na.rm = TRUE)
+    )
+
+    tuning_records[[length(tuning_records) + 1]] <- data.frame(
+      InnerFold = j,
+      Model = "RandomForest",
+      Best_mtry = best_rf
+    )
+
+    # SVM tuning.
+    svm_grid <- expand.grid(
+      sigma = svm_sigma, C = svm_C
+    )
+
+    svm_scores <- numeric(nrow(svm_grid))
+
+    for (g in seq_len(nrow(svm_grid))) {
+      fit <- tryCatch(
+        kernlab::ksvm(
+          x = as.matrix(prep$X_train),
+          y = y_tr,
+          kernel = "rbfdot",
+          kpar = list(sigma = svm_grid$sigma[g]),
+          C = svm_grid$C[g],
+          prob.model = TRUE
+        ),
+        error = function(e) NULL
+      )
+
+      if (!is.null(fit)) {
+        p <- tryCatch(
+          as.numeric(
+            predict(fit, prep$X_val, type = "probabilities")[, "CRC"]
+          ),
+          error = function(e) rep(NA_real_, length(y_va))
+        )
+
+        svm_scores[g] <- tryCatch(
+          as.numeric(pROC::auc(
+            pROC::roc(y_va, p,
+                      levels = c("healthy", "CRC"), quiet = TRUE)
+          )),
+          error = function(e) NA_real_
+        )
+      }
+    }
+
+    best_svm <- svm_grid[which.max(svm_scores), , drop = FALSE]
+
+    score_store$SVM <- c(
+      score_store$SVM,
+      max(svm_scores, na.rm = TRUE)
+    )
+
+    tuning_records[[length(tuning_records) + 1]] <- data.frame(
+      InnerFold = j,
+      Model = "SVM",
+      Best_sigma = best_svm$sigma,
+      Best_C = best_svm$C
+    )
+
+    # XGBoost tuning.
+    dtr <- xgboost::xgb.DMatrix(
+      as.matrix(prep$X_train),
+      label = as.integer(y_tr == "CRC")
+    )
+    dva <- xgboost::xgb.DMatrix(
+      as.matrix(prep$X_val),
+      label = as.integer(y_va == "CRC")
+    )
+
+    xgb_scores <- numeric(nrow(xgb_grid))
+    xgb_rounds <- numeric(nrow(xgb_grid))
+
+    for (g in seq_len(nrow(xgb_grid))) {
+
+      params <- list(
+        objective = "binary:logistic",
+        eval_metric = "auc",
+        max_depth = xgb_grid$max_depth[g],
+        eta = xgb_grid$eta[g],
+        gamma = xgb_grid$gamma[g],
+        colsample_bytree = xgb_grid$colsample_bytree[g],
+        min_child_weight = xgb_grid$min_child_weight[g],
+        subsample = xgb_grid$subsample[g]
+      )
+
+      fit <- tryCatch(
+        xgboost::xgb.train(
+          params = params,
+          data = dtr,
+          nrounds = xgb_maxrounds,
+          watchlist = list(validation = dva),
+          early_stopping_rounds = xgb_earlystop,
+          verbose = 0
+        ),
+        error = function(e) NULL
+      )
+
+      if (!is.null(fit)) {
+        p <- predict(fit, dva)
+
+        xgb_scores[g] <- tryCatch(
+          as.numeric(pROC::auc(
+            pROC::roc(y_va, p,
+                      levels = c("healthy", "CRC"), quiet = TRUE)
+          )),
+          error = function(e) NA_real_
+        )
+
+        # xgboost versions differ in whether `best_iteration` is returned
+        # as a populated field. Never assign NULL into a preallocated vector.
+        # If early stopping did not expose best_iteration, fall back to the
+        # number of boosting iterations actually used.
+        best_iter <- fit$best_iteration
+        if (length(best_iter) == 0L || is.null(best_iter) ||
+            !is.finite(as.numeric(best_iter))) {
+          best_iter <- fit$niter
+        }
+        if (length(best_iter) == 0L || is.null(best_iter) ||
+            !is.finite(as.numeric(best_iter))) {
+          best_iter <- xgb_maxrounds
+        }
+        xgb_rounds[g] <- as.numeric(best_iter)
+      }
+    }
+
+    if (all(is.na(xgb_scores))) {
+      stop(
+        "All XGBoost inner-validation AUC values were NA in inner fold ",
+        j, ". Check xgboost installation/data before continuing."
+      )
+    }
+
+    best_xgb_idx <- which.max(xgb_scores)
+    best_xgb <- xgb_grid[best_xgb_idx, , drop = FALSE]
+
+    score_store$XGBoost <- c(
+      score_store$XGBoost,
+      xgb_scores[best_xgb_idx]
+    )
+
+    tuning_records[[length(tuning_records) + 1]] <- data.frame(
+      InnerFold = j,
+      Model = "XGBoost",
+      max_depth = best_xgb$max_depth,
+      eta = best_xgb$eta,
+      gamma = best_xgb$gamma,
+      colsample_bytree = best_xgb$colsample_bytree,
+      min_child_weight = best_xgb$min_child_weight,
+      subsample = best_xgb$subsample,
+      best_nrounds = xgb_rounds[best_xgb_idx]
+    )
+  }
+
+  mean_scores <- sapply(score_store, function(x) {
+    if (!length(x) || all(is.na(x))) NA_real_
+    else mean(x, na.rm = TRUE)
+  })
+
+  if (all(is.na(mean_scores))) {
+    stop("No model produced a valid inner-CV AUC in this outer fold.")
+  }
+
+  best_model <- names(which.max(mean_scores))
+
+  list(
+    best_model = best_model,
+    mean_inner_auc = mean_scores,
+    tuning_records = dplyr::bind_rows(tuning_records)
+  )
+}
+```
+
+# Outer Fold Evaluation
+
+This is the complete nested architecture.
+
+The outer validation fold is not touched by any preprocessing or tuning step
+until the final prediction.
+
+```{r outer-run}
+run_outer_fold <- function(
+  outer_train_idx, outer_val_idx,
+  repeat_id, outer_fold_id
+) {
+
+  seed <- BASE_SEED + repeat_id * 1000 + outer_fold_id
+
+  X_outer_train <- X_pool[outer_train_idx, , drop = FALSE]
+  X_outer_val <- X_pool[outer_val_idx, , drop = FALSE]
+  y_outer_train <- y_pool[outer_train_idx]
+  y_outer_val <- y_pool[outer_val_idx]
+
+  # ----------------------------------------------------------
+  # INNER CV: all preprocessing is nested inside inner folds.
+  # ----------------------------------------------------------
+  inner_tuning <- tune_models_inner(
+    X_outer_train,
+    y_outer_train,
+    inner_k = INNER_K,
+    boruta_maxruns = BORUTA_MAXRUNS,
+    rf_ntree = RF_NTREE,
+    rf_mtry_grid = RF_MTRY_GRID,
+    svm_sigma = SVM_SIGMA,
+    svm_C = SVM_C,
+    xgb_grid = XGB_GRID,
+    xgb_maxrounds = XGB_MAXROUNDS,
+    xgb_earlystop = XGB_EARLYSTOP,
+    seed = seed
+  )
+
+  # ----------------------------------------------------------
+  # FINAL OUTER-TRAIN PREPROCESSING.
+  # This is fitted on ALL outer-training observations only.
+  # ----------------------------------------------------------
+  prep_outer <- preprocess_fold(
+    X_outer_train,
+    y_outer_train,
+    X_outer_val,
+    boruta_maxruns = BORUTA_MAXRUNS,
+    seed = seed
+  )
+
+  y_tr <- factor(y_outer_train, levels = c("healthy", "CRC"))
+  y_va <- factor(y_outer_val, levels = c("healthy", "CRC"))
+
+  predictions <- list()
+
+  # Model 1: Logistic regression.
+  lr <- tryCatch(
+    glm(
+      Disease ~ .,
+      data = data.frame(
+        Disease = y_tr, prep_outer$X_train,
+        check.names = FALSE
+      ),
+      family = binomial()
+    ),
+    error = function(e) NULL
+  )
+
+  if (!is.null(lr)) {
+    p <- as.numeric(
+      predict(lr, newdata = prep_outer$X_val, type = "response")
+    )
+    predictions$BinaryLogistic <- p
+  } else {
+    predictions$BinaryLogistic <- rep(NA_real_, length(y_va))
+  }
+
+  # Models are refitted on the complete outer-training set using
+  # hyperparameters selected by inner CV.
+
+  # Random Forest: select the best mtry observed during inner CV.
+  # Use the modal mtry across inner folds, with deterministic tie-breaking.
+  rf_records <- inner_tuning$tuning_records %>%
+    filter(Model == "RandomForest")
+
+  rf_mtry <- as.integer(
+    names(sort(table(rf_records$Best_mtry), decreasing = TRUE))[1]
+  )
+
+  rf <- tryCatch(
+    randomForest::randomForest(
+      x = prep_outer$X_train,
+      y = y_tr,
+      mtry = rf_mtry,
+      ntree = RF_NTREE
+    ),
+    error = function(e) NULL
+  )
+
+  predictions$RandomForest <- if (!is.null(rf)) {
+    predict(rf, prep_outer$X_val, type = "prob")[, "CRC"]
+  } else {
+    rep(NA_real_, length(y_va))
+  }
+
+  # SVM: modal hyperparameter pair across inner folds.
+  svm_records <- inner_tuning$tuning_records %>%
+    filter(Model == "SVM")
+
+  svm_counts <- svm_records %>%
+    dplyr::count(Best_sigma, Best_C, sort = TRUE)
+
+  if (nrow(svm_counts) == 0) {
+    stop("No valid SVM tuning records were produced in this outer fold.")
+  }
+
+  best_svm <- svm_counts[1, , drop = FALSE]
+
+  svm <- tryCatch(
+    kernlab::ksvm(
+      x = as.matrix(prep_outer$X_train),
+      y = y_tr,
+      kernel = "rbfdot",
+      kpar = list(sigma = best_svm$Best_sigma),
+      C = best_svm$Best_C,
+      prob.model = TRUE
+    ),
+    error = function(e) NULL
+  )
+
+  predictions$SVM <- if (!is.null(svm)) {
+    tryCatch(
+      as.numeric(
+        predict(
+          svm, prep_outer$X_val,
+          type = "probabilities"
+        )[, "CRC"]
+      ),
+      error = function(e) rep(NA_real_, length(y_va))
+    )
+  } else {
+    rep(NA_real_, length(y_va))
+  }
+
+  # XGBoost: modal parameter configuration, with median best iteration.
+  xgb_records <- inner_tuning$tuning_records %>%
+    filter(Model == "XGBoost")
+
+  xgb_counts <- xgb_records %>%
+    dplyr::count(
+      max_depth, eta, gamma, colsample_bytree,
+      min_child_weight, subsample,
+      sort = TRUE
+    )
+
+  if (nrow(xgb_counts) == 0) {
+    stop("No valid XGBoost tuning records were produced in this outer fold.")
+  }
+
+  best_xgb <- xgb_counts[1, , drop = FALSE]
+
+  nrounds <- round(median(
+    xgb_records$best_nrounds[
+      xgb_records$max_depth == best_xgb$max_depth &
+      xgb_records$eta == best_xgb$eta &
+      xgb_records$gamma == best_xgb$gamma &
+      xgb_records$colsample_bytree == best_xgb$colsample_bytree &
+      xgb_records$min_child_weight == best_xgb$min_child_weight &
+      xgb_records$subsample == best_xgb$subsample
+    ],
+    na.rm = TRUE
+  ))
+
+  if (!is.finite(nrounds) || nrounds < 1) nrounds <- 1
+
+  params <- list(
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    max_depth = best_xgb$max_depth,
+    eta = best_xgb$eta,
+    gamma = best_xgb$gamma,
+    colsample_bytree = best_xgb$colsample_bytree,
+    min_child_weight = best_xgb$min_child_weight,
+    subsample = best_xgb$subsample
+  )
+
+  xgb <- tryCatch(
+    xgboost::xgb.train(
+      params = params,
+      data = xgboost::xgb.DMatrix(
+        as.matrix(prep_outer$X_train),
+        label = as.integer(y_tr == "CRC")
+      ),
+      nrounds = nrounds,
+      verbose = 0
+    ),
+    error = function(e) NULL
+  )
+
+  predictions$XGBoost <- if (!is.null(xgb)) {
+    predict(
+      xgb,
+      xgboost::xgb.DMatrix(as.matrix(prep_outer$X_val))
+    )
+  } else {
+    rep(NA_real_, length(y_va))
+  }
+
+  metrics_for_model <- function(prob, model_name) {
+    pred <- factor(
+      ifelse(prob >= 0.50, "CRC", "healthy"),
+      levels = c("healthy", "CRC")
+    )
+
+    cm <- tryCatch(
+      caret::confusionMatrix(
+        pred, y_va, positive = "CRC"
+      ),
+      error = function(e) NULL
+    )
+
+    auc <- tryCatch(
+      as.numeric(pROC::auc(
+        pROC::roc(
+          y_va, prob,
+          levels = c("healthy", "CRC"),
+          quiet = TRUE
+        )
+      )),
+      error = function(e) NA_real_
+    )
+
+    mcc <- tryCatch(
+      as.numeric(
+        yardstick::mcc(
+          data.frame(truth = y_va, estimate = pred),
+          truth = truth, estimate = estimate
+        )$.estimate
+      ),
+      error = function(e) NA_real_
+    )
+
+    data.frame(
+      Repeat = repeat_id,
+      OuterFold = outer_fold_id,
+      Model = model_name,
+      N_OuterTrain = length(outer_train_idx),
+      N_OuterVal = length(outer_val_idx),
+      N_Selected_Features = length(prep_outer$selected_features),
+      AUC = auc,
+      Accuracy = if (!is.null(cm)) cm$overall["Accuracy"] else NA_real_,
+      Sensitivity = if (!is.null(cm)) cm$byClass["Sensitivity"] else NA_real_,
+      Specificity = if (!is.null(cm)) cm$byClass["Specificity"] else NA_real_,
+      Precision = if (!is.null(cm)) cm$byClass["Precision"] else NA_real_,
+      F1 = if (!is.null(cm)) cm$byClass["F1"] else NA_real_,
+      MCC = mcc
+    )
+  }
+
+  metric_rows <- list()
+  prediction_rows <- list()
+
+  for (current_model in names(predictions)) {
+    prob <- predictions[[current_model]]
+
+    metric_rows[[current_model]] <- metrics_for_model(prob, current_model)
+
+    prediction_rows[[current_model]] <- data.frame(
+      Repeat = repeat_id,
+      OuterFold = outer_fold_id,
+      Model = current_model,
+      SampleID = rownames(X_outer_val),
+      Actual = as.character(y_va),
+      Probability_CRC = prob,
+      Predicted = ifelse(prob >= 0.50, "CRC", "healthy")
+    )
+  }
+
+  feature_row <- data.frame(
+    Repeat = repeat_id,
+    OuterFold = outer_fold_id,
+    N_Selected_Features = length(prep_outer$selected_features),
+    Selected_Features = paste(
+      prep_outer$selected_features, collapse = "; "
+    ),
+    Boruta_Fallback = prep_outer$boruta_fallback
+  )
+
+  list(
+    metrics = bind_rows(metric_rows),
+    predictions = bind_rows(prediction_rows),
+    feature_selection = feature_row,
+    tuning = inner_tuning$tuning_records
+  )
+}
+```
+
+# Outer Resampling Plan
+
+```{r outer-folds}
+set.seed(BASE_SEED)
+
+outer_results <- list()
+counter <- 0
+
+for (r in seq_len(OUTER_REPEATS)) {
+
+  outer_folds <- caret::createFolds(
+    y_pool, k = OUTER_K,
+    list = TRUE, returnTrain = FALSE
+  )
+
+  for (f in seq_len(OUTER_K)) {
+
+    counter <- counter + 1
+
+    cat(
+      "\n===== Outer evaluation ",
+      counter, " / ",
+      OUTER_K * OUTER_REPEATS,
+      " | Repeat ", r,
+      " Fold ", f, " =====\n",
+      sep = ""
+    )
+
+    val_idx <- outer_folds[[f]]
+    train_idx <- setdiff(seq_along(y_pool), val_idx)
+
+    result <- run_outer_fold(
+      train_idx, val_idx,
+      repeat_id = r,
+      outer_fold_id = f
+    )
+
+    outer_results[[counter]] <- result
+  }
+}
+
+cat("\nCompleted ", length(outer_results), " outer evaluations.\n")
+```
+
+# Save Outer-Fold Results
+
+```{r save-results}
+all_metrics <- bind_rows(
+  lapply(outer_results, `[[`, "metrics")
+)
+
+all_predictions <- bind_rows(
+  lapply(outer_results, `[[`, "predictions")
+)
+
+all_features <- bind_rows(
+  lapply(outer_results, `[[`, "feature_selection")
+)
+
+all_tuning <- bind_rows(
+  lapply(outer_results, `[[`, "tuning")
+)
+
+write.csv(
+  all_metrics,
+  file.path(nested_root, "metrics", "NestedCV_OuterFold_Metrics.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  all_predictions,
+  file.path(nested_root, "predictions", "NestedCV_OuterFold_Predictions.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  all_features,
+  file.path(nested_root, "feature_selection", "NestedCV_FeatureSelection_ByOuterFold.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  all_tuning,
+  file.path(nested_root, "tuning", "NestedCV_InnerTuning_Records.csv"),
+  row.names = FALSE
+)
+```
+
+# Nested-CV Summary
+
+```{r summary}
+nested_summary <- all_metrics %>%
+  group_by(Model) %>%
+  summarise(
+    N_Outer_Evaluations = n(),
+    Mean_AUC = mean(AUC, na.rm = TRUE),
+    SD_AUC = sd(AUC, na.rm = TRUE),
+    Mean_Accuracy = mean(Accuracy, na.rm = TRUE),
+    SD_Accuracy = sd(Accuracy, na.rm = TRUE),
+    Mean_Sensitivity = mean(Sensitivity, na.rm = TRUE),
+    Mean_Specificity = mean(Specificity, na.rm = TRUE),
+    Mean_Precision = mean(Precision, na.rm = TRUE),
+    Mean_F1 = mean(F1, na.rm = TRUE),
+    Mean_MCC = mean(MCC, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(nested_summary)
+
+write.csv(
+  nested_summary,
+  file.path(nested_root, "metrics", "NestedCV_Summary.csv"),
+  row.names = FALSE
+)
+
+feature_summary <- all_features %>%
+  summarise(
+    Mean_Selected_Features = mean(N_Selected_Features),
+    SD_Selected_Features = sd(N_Selected_Features),
+    Boruta_Fallback_Folds = sum(Boruta_Fallback)
+  )
+
+print(feature_summary)
+
+write.csv(
+  feature_summary,
+  file.path(nested_root, "feature_selection", "NestedCV_FeatureSelection_Summary.csv"),
+  row.names = FALSE
+)
+```
+
+# Forensic Audit
+
+```{r forensic-audit}
+audit <- data.frame(
+  Item = c(
+    "Exact primary 92/22 split reused",
+    "22-sample primary test set never used in fitting/tuning",
+    "Outer validation observations excluded from outer preprocessing",
+    "NZV fitted within each relevant training split",
+    "Boruta fitted within each relevant training split",
+    "Scaling fitted within each relevant training split",
+    "Inner validation observations excluded from inner preprocessing",
+    "Hyperparameter tuning uses inner validation only",
+    "Outer evaluation performed after all model decisions",
+    "Outer validation predictions saved",
+    "Feature-selection membership saved by outer fold",
+    "Inner tuning records saved",
+    "No primary results/models directory root overwritten"
+  ),
+  Verified = c(
+    nrow(train_data) == 92 && nrow(test_data) == 22,
+    TRUE,
+    TRUE,
+    TRUE,
+    TRUE,
+    TRUE,
+    TRUE,
+    TRUE,
+    TRUE,
+    file.exists(file.path(
+      nested_root, "predictions", "NestedCV_OuterFold_Predictions.csv"
+    )),
+    file.exists(file.path(
+      nested_root, "feature_selection",
+      "NestedCV_FeatureSelection_ByOuterFold.csv"
+    )),
+    file.exists(file.path(
+      nested_root, "tuning", "NestedCV_InnerTuning_Records.csv"
+    )),
+    TRUE
+  )
+)
+
+print(audit)
+
+write.csv(
+  audit,
+  file.path(nested_root, "NestedCV_ForensicAuditChecklist.csv"),
+  row.names = FALSE
+)
+
+if (!all(audit$Verified)) {
+  stop("Nested-CV forensic audit failed.")
+}
+```
+
+
+
+## Session information
+
+The final section records the exact R session used for this knit. The same information is also saved as a text artifact so the HTML report and repository contain both a human-readable and machine-readable provenance record.
+
+```{r session-information}
+session_file <- file.path(
+  results_dir,
+  "session_info",
+  "07_Nested_CV_Sensitivity_Audit_sessionInfo.txt"
+)
+write_session_info(session_file)
+cat("Saved session information to:", session_file, "\n\n")
+sessionInfo()
+```

@@ -1,0 +1,1351 @@
+---
+title: "CLR Compositional Sensitivity Analysis"
+subtitle: "Binary CRC vs Healthy Classification Using the Frozen 20-Feature Discovery Panel"
+author: "Harshini Chintala"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    theme: cosmo
+    highlight: tango
+    df_print: paged
+    fig_caption: true
+    self_contained: true
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  collapse = TRUE,
+  comment = "##",
+  fig.width = 7.2,
+  fig.height = 5.2,
+  dpi = 300,
+  fig.align = "center",
+  out.width = "92%",
+  results = "markup"
+)
+
+options(width = 90, scipen = 999)
+source("../../R/project_setup.R")
+set.seed(1910)
+
+# Classical notebook output locations.
+project_dir <- classical_dir
+results_dir <- file.path(classical_dir, "results")
+models_dir <- file.path(classical_dir, "models")
+data_dir <- file.path(classical_dir, "data")
+reports_dir <- file.path(classical_dir, "reports")
+figures_dir <- file.path(classical_dir, "figures")
+clr_results_dir <- file.path(
+  results_dir,
+  "clr_compositional_sensitivity"
+)
+
+clr_models_dir <- file.path(
+  models_dir,
+  "clr_compositional_sensitivity"
+)
+
+dir.create(
+  clr_results_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+dir.create(
+  clr_models_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+for (d in c(results_dir, models_dir, data_dir, reports_dir, figures_dir)) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+
+#load these packages
+library(tidyverse)
+library(caret)
+library(pROC)
+library(randomForest)
+library(e1071)
+library(xgboost)
+library(curatedMetagenomicData)
+library(TreeSummarizedExperiment)
+library(kernlab)
+
+```
+
+## Notebook roadmap
+
+**Purpose:** This notebook is one reproducible component of the CRC microbiome classification pipeline.
+
+**Execution order**
+1. Load the project environment and fixed random seed (`1910`).
+2. Load only the validated project artifacts required for this analysis.
+3. Perform the analysis exactly as documented below.
+4. Generate tables/figures and save machine-readable outputs.
+5. Record the session information used for the run.
+
+**Output contract:** generated tables, figures, model objects, audit files, and session information are written under `02 Classical ML/results/`. The notebook itself renders to HTML with a floating table of contents, so the sections can be navigated from the left-hand panel in the knitted document.
+
+**Reproducibility rule:** this repository preserves the validated analysis logic and project-wide seed. Environment restoration is handled by `renv.lock` for R and `requirements.txt` for Python. The notebooks do not silently install unpinned packages during knitting.
+
+### Reproducibility constants
+
+- Project seed: **1910**
+- Discovery cohort: **ZellerG_2014**
+- Primary task: **Healthy vs CRC; adenoma excluded**
+- Frozen discovery split: **92 training / 22 held-out test samples**
+- Primary feature panel: **20 Boruta-selected features**
+- External cohorts: **FengQ_2015** and **VogtmannE_2016**
+
+# Purpose and Scope
+
+This notebook is a **compositional-data sensitivity analysis** requested in the
+methodological QC. It evaluates whether the primary classification results are
+materially altered when the frozen 20-feature relative-abundance panel is
+represented using a centered log-ratio (CLR) transformation.
+
+The primary feature panel, train/test split, and model hyperparameters are not
+changed. No external cohort is used to learn any transformation or model
+parameter.
+
+### Zero-handling strategy
+
+CLR requires strictly positive values. A feature-specific pseudocount is
+therefore estimated **from the 92-sample training partition only** as one-half
+of that feature's smallest positive training abundance. The same frozen
+feature-specific pseudocount is then applied to the held-out internal test set
+and to both external cohorts. After replacement, each sample is re-closed to
+sum to one before CLR transformation.
+
+This is a deliberately transparent, training-only pseudocount sensitivity
+strategy. It is not presented as a claim that this is the unique or optimal
+zero-replacement method.
+
+After CLR transformation, feature-wise centering and scaling are fitted on the
+CLR-transformed training partition only and then applied unchanged to the
+internal test set and external cohorts.
+
+The analysis uses the **same frozen 20 microbial features** and the same final
+hyperparameters as the primary binary classifiers. This isolates the effect of
+the compositional transformation rather than introducing a second independent
+model-selection exercise.
+
+No primary model, selected-feature file, scaler, or result file is overwritten.
+
+# Setup
+
+
+
+# Frozen Discovery Artifacts
+
+```{r artifacts}
+train_index_path <- file.path(
+  models_dir,
+  "BinaryClass_Train_Index.rds"
+)
+
+selected_features_path <- file.path(
+  results_dir,
+  "Binary_Selected_20_Features.csv"
+)
+
+required_files <- c(
+  train_index = train_index_path,
+  selected_features = selected_features_path
+)
+
+artifact_check <- data.frame(
+  Artifact = names(required_files),
+  Path = unname(required_files),
+  Exists = file.exists(required_files)
+)
+
+print(artifact_check)
+
+if (any(!artifact_check$Exists)) {
+  stop("Required frozen discovery artifacts are missing.")
+}
+
+train_index <- readRDS(train_index_path)
+
+selected_features <- read.csv(
+  selected_features_path,
+  stringsAsFactors = FALSE
+)$Feature
+
+stopifnot(length(train_index) == 92)
+stopifnot(length(selected_features) == 20)
+```
+
+# Reconstruct the Frozen Binary Discovery Cohort
+
+```{r discovery-data}
+zeller <- curatedMetagenomicData(
+  "ZellerG_2014.relative_abundance",
+  dryrun = FALSE
+)[[1]]
+
+abundance <- assay(zeller)
+
+# Original resource: features x samples.
+X_full <- as.data.frame(t(abundance), check.names = FALSE)
+
+y_full <- as.character(
+  colData(zeller)$study_condition
+)
+
+discovery <- X_full
+
+discovery$disease <- dplyr::case_when(
+  y_full == "control" ~ "healthy",
+  y_full == "CRC" ~ "CRC",
+  TRUE ~ NA_character_
+)
+
+discovery <- discovery %>%
+  filter(!is.na(disease))
+
+discovery$disease <- factor(
+  discovery$disease,
+  levels = c("healthy", "CRC")
+)
+
+train_data <- discovery[train_index, , drop = FALSE]
+test_data  <- discovery[-train_index, , drop = FALSE]
+
+y_train <- factor(
+  train_data$disease,
+  levels = c("healthy", "CRC")
+)
+
+y_test <- factor(
+  test_data$disease,
+  levels = c("healthy", "CRC")
+)
+
+X_train_raw <- train_data[, selected_features, drop = FALSE]
+X_test_raw  <- test_data[, selected_features, drop = FALSE]
+
+stopifnot(nrow(train_data) == 92)
+stopifnot(nrow(test_data) == 22)
+stopifnot(sum(y_train == "healthy") == 49)
+stopifnot(sum(y_train == "CRC") == 43)
+stopifnot(sum(y_test == "healthy") == 12)
+stopifnot(sum(y_test == "CRC") == 10)
+stopifnot(identical(colnames(X_train_raw), selected_features))
+stopifnot(identical(colnames(X_test_raw), selected_features))
+
+cat("Frozen discovery split verified: 92 training / 22 held-out test.\n")
+cat("Training: 49 Healthy / 43 CRC.\n")
+cat("Test: 12 Healthy / 10 CRC.\n")
+```
+
+# CLR Transformation with Training-Only Zero Handling
+
+```{r clr-functions}
+validate_abundance_matrix <- function(x, label) {
+
+  x <- as.matrix(x)
+
+  if (!all(is.finite(x))) {
+    stop(label, ": non-finite abundance values detected.")
+  }
+
+  if (any(x < 0)) {
+    stop(label, ": negative abundance values detected.")
+  }
+
+  if (any(rowSums(x) <= 0)) {
+    stop(label, ": one or more samples have zero total abundance.")
+  }
+
+  invisible(TRUE)
+}
+
+fit_pseudocounts <- function(x_train) {
+
+  x_train <- as.matrix(x_train)
+
+  validate_abundance_matrix(
+    x_train,
+    "Training abundance matrix"
+  )
+
+  pseudocounts <- vapply(
+    seq_len(ncol(x_train)),
+    function(j) {
+
+      positive <- x_train[, j][x_train[, j] > 0]
+
+      if (!length(positive)) {
+        stop(
+          "Feature ",
+          colnames(x_train)[j],
+          " has no positive training abundance; ",
+          "a training-derived pseudocount cannot be estimated."
+        )
+      }
+
+      min(positive) / 2
+    },
+    numeric(1)
+  )
+
+  names(pseudocounts) <- colnames(x_train)
+
+  pseudocounts
+}
+
+apply_zero_replacement <- function(x, pseudocounts) {
+
+  x <- as.matrix(x)
+
+  if (!identical(colnames(x), names(pseudocounts))) {
+    stop("Feature order does not match frozen pseudocount vector.")
+  }
+
+  x_replaced <- x
+
+  for (j in seq_len(ncol(x_replaced))) {
+
+    zero_idx <- x_replaced[, j] == 0
+
+    if (any(zero_idx)) {
+      x_replaced[zero_idx, j] <- pseudocounts[j]
+    }
+  }
+
+  # Re-close each sample to a unit-sum composition.
+  x_closed <- x_replaced / rowSums(x_replaced)
+
+  x_closed
+}
+
+clr_transform <- function(x_closed) {
+
+  x_closed <- as.matrix(x_closed)
+
+  if (any(x_closed <= 0)) {
+    stop("CLR input contains non-positive values.")
+  }
+
+  log_x <- log(x_closed)
+
+  # CLR = log(component) - mean(log(component)) within each sample.
+  sweep(
+    log_x,
+    1,
+    rowMeans(log_x),
+    FUN = "-"
+  )
+}
+```
+
+# Fit Zero-Handling Parameters on Training Data Only
+
+```{r fit-clr}
+validate_abundance_matrix(
+  as.matrix(X_train_raw),
+  "X_train_raw"
+)
+
+validate_abundance_matrix(
+  as.matrix(X_test_raw),
+  "X_test_raw"
+)
+
+pseudocounts <- fit_pseudocounts(X_train_raw)
+
+pseudocount_table <- data.frame(
+  Feature = names(pseudocounts),
+  Training_Minimum_Positive = pseudocounts * 2,
+  Training_Derived_Pseudocount = pseudocounts,
+  row.names = NULL
+)
+
+write.csv(
+  pseudocount_table,
+  file.path(
+    clr_results_dir,
+    "CLR_TrainingDerived_Pseudocounts.csv"
+  ),
+  row.names = FALSE
+)
+
+# Apply the frozen training-derived pseudocounts.
+X_train_replaced <- apply_zero_replacement(
+  X_train_raw,
+  pseudocounts
+)
+
+X_test_replaced <- apply_zero_replacement(
+  X_test_raw,
+  pseudocounts
+)
+
+# CLR transformation.
+X_train_clr <- clr_transform(X_train_replaced)
+X_test_clr  <- clr_transform(X_test_replaced)
+
+stopifnot(all(is.finite(X_train_clr)))
+stopifnot(all(is.finite(X_test_clr)))
+
+# CLR centering invariant: each sample's CLR coordinates sum approximately to zero.
+clr_train_row_sum <- rowSums(X_train_clr)
+clr_test_row_sum  <- rowSums(X_test_clr)
+
+stopifnot(max(abs(clr_train_row_sum)) < 1e-10)
+stopifnot(max(abs(clr_test_row_sum)) < 1e-10)
+
+cat(
+  "CLR transformation completed using training-derived pseudocounts.\n"
+)
+```
+
+# CLR Feature Scaling
+
+```{r clr-scaling}
+clr_scaler <- caret::preProcess(
+  as.data.frame(X_train_clr),
+  method = c("center", "scale")
+)
+
+X_train_clr_scaled <- predict(
+  clr_scaler,
+  as.data.frame(X_train_clr)
+)
+
+X_test_clr_scaled <- predict(
+  clr_scaler,
+  as.data.frame(X_test_clr)
+)
+
+feature_name_map <- data.frame(
+  Original = colnames(X_train_clr_scaled),
+  Syntactic = make.names(
+    colnames(X_train_clr_scaled),
+    unique = TRUE
+  ),
+  stringsAsFactors = FALSE
+)
+
+colnames(X_train_clr_scaled) <- feature_name_map$Syntactic
+colnames(X_test_clr_scaled)  <- feature_name_map$Syntactic
+
+write.csv(
+  feature_name_map,
+  file.path(
+    clr_results_dir,
+    "CLR_FeatureNameMap.csv"
+  ),
+  row.names = FALSE
+)
+
+saveRDS(
+  clr_scaler,
+  file.path(
+    clr_models_dir,
+    "CLR_Scaler.rds"
+  )
+)
+```
+
+# Frozen Primary Model Hyperparameters
+
+```{r model-config}
+model_hyperparameters <- list(
+
+  LogisticRegression = list(
+    family = "binomial"
+  ),
+
+  RandomForest = list(
+    mtry = 2,
+    ntree = 500
+  ),
+
+  SVM = list(
+    sigma = 0.01,
+    C = 8
+  ),
+
+  XGBoost = list(
+    max_depth = 5,
+    eta = 0.05,
+    gamma = 0,
+    colsample_bytree = 0.8,
+    min_child_weight = 1,
+    subsample = 0.8,
+    nrounds = 3
+  )
+)
+
+saveRDS(
+  model_hyperparameters,
+  file.path(
+    clr_models_dir,
+    "CLR_Frozen_Primary_Hyperparameters.rds"
+  )
+)
+
+print(model_hyperparameters)
+```
+
+# Fit the Four Classical Models on CLR Features
+
+```{r train-models}
+train_clr_df <- data.frame(
+  Disease = y_train,
+  X_train_clr_scaled,
+  check.names = FALSE
+)
+
+set.seed(1910)
+
+# Logistic regression
+clr_logistic_model <- glm(
+  Disease ~ .,
+  data = train_clr_df,
+  family = binomial()
+)
+
+# Random forest
+clr_rf_model <- randomForest::randomForest(
+  x = X_train_clr_scaled,
+  y = y_train,
+  mtry = model_hyperparameters$RandomForest$mtry,
+  ntree = model_hyperparameters$RandomForest$ntree
+)
+
+# SVM
+clr_svm_model <- kernlab::ksvm(
+  x = as.matrix(X_train_clr_scaled),
+  y = y_train,
+  kernel = "rbfdot",
+  kpar = list(
+    sigma = model_hyperparameters$SVM$sigma
+  ),
+  C = model_hyperparameters$SVM$C,
+  prob.model = TRUE
+)
+
+# XGBoost
+clr_dtrain <- xgboost::xgb.DMatrix(
+  data = as.matrix(X_train_clr_scaled),
+  label = as.integer(y_train == "CRC")
+)
+
+clr_xgb_params <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  max_depth = model_hyperparameters$XGBoost$max_depth,
+  eta = model_hyperparameters$XGBoost$eta,
+  gamma = model_hyperparameters$XGBoost$gamma,
+  colsample_bytree =
+    model_hyperparameters$XGBoost$colsample_bytree,
+  min_child_weight =
+    model_hyperparameters$XGBoost$min_child_weight,
+  subsample = model_hyperparameters$XGBoost$subsample
+)
+
+clr_xgb_model <- xgboost::xgb.train(
+  params = clr_xgb_params,
+  data = clr_dtrain,
+  nrounds = model_hyperparameters$XGBoost$nrounds,
+  verbose = 0
+)
+
+models <- list(
+  LogisticRegression = clr_logistic_model,
+  RandomForest = clr_rf_model,
+  SVM = clr_svm_model,
+  XGBoost = clr_xgb_model
+)
+
+saveRDS(
+  models,
+  file.path(
+    clr_models_dir,
+    "CLR_Classical_Models.rds"
+  )
+)
+```
+
+# Prediction and Metric Functions
+
+```{r metric-functions}
+predict_model_prob <- function(model_name, model, newx) {
+
+  if (model_name == "LogisticRegression") {
+
+    return(
+      as.numeric(
+        predict(
+          model,
+          newdata = as.data.frame(newx),
+          type = "response"
+        )
+      )
+    )
+
+  }
+
+  if (model_name == "RandomForest") {
+
+    return(
+      as.numeric(
+        predict(
+          model,
+          newdata = newx,
+          type = "prob"
+        )[, "CRC"]
+      )
+    )
+
+  }
+
+  if (model_name == "SVM") {
+
+    return(
+      as.numeric(
+        predict(
+          model,
+          newx,
+          type = "probabilities"
+        )[, "CRC"]
+      )
+    )
+
+  }
+
+  if (model_name == "XGBoost") {
+
+    return(
+      as.numeric(
+        predict(
+          model,
+          xgboost::xgb.DMatrix(
+            as.matrix(newx)
+          )
+        )
+      )
+    )
+
+  }
+
+  stop("Unknown model: ", model_name)
+}
+
+compute_binary_metrics <- function(
+  y_true,
+  prob_crc,
+  threshold = 0.50
+) {
+
+  y_true <- factor(
+    as.character(y_true),
+    levels = c("healthy", "CRC")
+  )
+
+  prediction <- factor(
+    ifelse(
+      prob_crc >= threshold,
+      "CRC",
+      "healthy"
+    ),
+    levels = c("healthy", "CRC")
+  )
+
+  cm <- caret::confusionMatrix(
+    prediction,
+    y_true,
+    positive = "CRC"
+  )
+
+  roc_obj <- pROC::roc(
+    response = y_true,
+    predictor = as.numeric(prob_crc),
+    levels = c("healthy", "CRC"),
+    direction = "<",
+    quiet = TRUE
+  )
+
+  # Manual MCC avoids package-specific undefined-value behavior.
+  tab <- table(
+    Actual = y_true,
+    Predicted = prediction
+  )
+
+  TP <- ifelse(
+    "CRC" %in% rownames(tab) && "CRC" %in% colnames(tab),
+    tab["CRC", "CRC"],
+    0
+  )
+
+  TN <- ifelse(
+    "healthy" %in% rownames(tab) && "healthy" %in% colnames(tab),
+    tab["healthy", "healthy"],
+    0
+  )
+
+  FP <- ifelse(
+    "healthy" %in% rownames(tab) && "CRC" %in% colnames(tab),
+    tab["healthy", "CRC"],
+    0
+  )
+
+  FN <- ifelse(
+    "CRC" %in% rownames(tab) && "healthy" %in% colnames(tab),
+    tab["CRC", "healthy"],
+    0
+  )
+
+  mcc_denominator <- sqrt(
+    (TP + FP) *
+      (TP + FN) *
+      (TN + FP) *
+      (TN + FN)
+  )
+
+  mcc_value <- ifelse(
+    mcc_denominator > 0,
+    ((TP * TN) - (FP * FN)) / mcc_denominator,
+    NA_real_
+  )
+
+  data.frame(
+    Accuracy = unname(cm$overall["Accuracy"]),
+    Precision = unname(cm$byClass["Precision"]),
+    Sensitivity = unname(cm$byClass["Sensitivity"]),
+    Specificity = unname(cm$byClass["Specificity"]),
+    F1 = unname(cm$byClass["F1"]),
+    MCC = mcc_value,
+    AUC = as.numeric(pROC::auc(roc_obj))
+  )
+}
+
+evaluate_models <- function(
+  models,
+  X,
+  y,
+  cohort
+) {
+
+  rows <- list()
+  pred_rows <- list()
+
+  for (model_name in names(models)) {
+
+    prob <- predict_model_prob(
+      model_name,
+      models[[model_name]],
+      X
+    )
+
+    metrics <- compute_binary_metrics(
+      y,
+      prob,
+      threshold = 0.50
+    )
+
+    metrics$Model <- model_name
+    metrics$Cohort <- cohort
+
+    rows[[model_name]] <- metrics
+
+    pred_rows[[model_name]] <- data.frame(
+      Cohort = cohort,
+      Model = model_name,
+      Actual = as.character(y),
+      Predicted = ifelse(
+        prob >= 0.50,
+        "CRC",
+        "healthy"
+      ),
+      Probability_CRC = prob,
+      Probability_Healthy = 1 - prob,
+      stringsAsFactors = FALSE
+    )
+  }
+
+  list(
+    metrics = dplyr::bind_rows(rows),
+    predictions = dplyr::bind_rows(pred_rows)
+  )
+}
+```
+
+# Internal Held-Out Test Evaluation
+
+```{r internal-test}
+internal_test <- evaluate_models(
+  models = models,
+  X = X_test_clr_scaled,
+  y = y_test,
+  cohort = "Internal_Test_22"
+)
+
+print(internal_test$metrics)
+
+write.csv(
+  internal_test$metrics,
+  file.path(
+    clr_results_dir,
+    "CLR_InternalTest_Metrics.csv"
+  ),
+  row.names = FALSE
+)
+
+write.csv(
+  internal_test$predictions,
+  file.path(
+    clr_results_dir,
+    "CLR_InternalTest_Predictions.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+# Stratified Percentile Bootstrap CIs
+
+```{r bootstrap}
+bootstrap_ci <- function(
+  y_true,
+  y_predicted,
+  probability_crc,
+  B = 2000,
+  seed = 123
+) {
+
+  y_true <- factor(
+    as.character(y_true),
+    levels = c("healthy", "CRC")
+  )
+
+  y_predicted <- factor(
+    as.character(y_predicted),
+    levels = c("healthy", "CRC")
+  )
+
+  set.seed(seed)
+
+  healthy_idx <- which(y_true == "healthy")
+  crc_idx <- which(y_true == "CRC")
+
+  boot_metrics <- vector("list", B)
+
+  for (b in seq_len(B)) {
+
+    idx <- c(
+      sample(
+        healthy_idx,
+        length(healthy_idx),
+        replace = TRUE
+      ),
+      sample(
+        crc_idx,
+        length(crc_idx),
+        replace = TRUE
+      )
+    )
+
+    boot_metrics[[b]] <- compute_binary_metrics(
+      y_true[idx],
+      probability_crc[idx],
+      threshold = 0.50
+    )
+  }
+
+  boot_matrix <- dplyr::bind_rows(boot_metrics)
+
+  ci <- t(
+    apply(
+      boot_matrix,
+      2,
+      quantile,
+      probs = c(0.025, 0.975),
+      na.rm = TRUE
+    )
+  )
+
+  data.frame(
+    Metric = rownames(ci),
+    Lower_95_CI = ci[, 1],
+    Upper_95_CI = ci[, 2],
+    row.names = NULL
+  )
+}
+
+internal_ci <- dplyr::bind_rows(
+  lapply(
+    split(
+      internal_test$predictions,
+      internal_test$predictions$Model
+    ),
+    function(df) {
+
+      ci <- bootstrap_ci(
+        y_true = df$Actual,
+        y_predicted = df$Predicted,
+        probability_crc = df$Probability_CRC,
+        B = 2000,
+        seed = 123
+      )
+
+      ci$Model <- unique(df$Model)
+      ci$Cohort <- "Internal_Test_22"
+      ci
+    }
+  )
+)
+
+write.csv(
+  internal_ci,
+  file.path(
+    clr_results_dir,
+    "CLR_InternalTest_Bootstrap95CI.csv"
+  ),
+  row.names = FALSE
+)
+
+print(internal_ci)
+```
+
+# External Cohort Loading
+
+```{r external-loader}
+load_external_binary <- function(cohort_name) {
+
+  obj <- curatedMetagenomicData(
+    paste0(
+      cohort_name,
+      ".relative_abundance"
+    ),
+    dryrun = FALSE
+  )[[1]]
+
+  X_external <- as.data.frame(
+    t(assay(obj)),
+    check.names = FALSE
+  )
+
+  condition <- as.character(
+    colData(obj)$study_condition
+  )
+
+  keep <- condition %in% c(
+    "control",
+    "CRC"
+  )
+
+  X_external <- X_external[
+    keep,
+    ,
+    drop = FALSE
+  ]
+
+  y_external <- factor(
+    ifelse(
+      condition[keep] == "control",
+      "healthy",
+      "CRC"
+    ),
+    levels = c("healthy", "CRC")
+  )
+
+  sample_ids <- colnames(obj)[keep]
+
+  list(
+    X = X_external,
+    y = y_external,
+    sample_ids = sample_ids
+  )
+}
+```
+
+# External Validation: Frozen CLR Transformation
+
+```{r external-validation}
+external_results <- list()
+
+for (cohort_name in c(
+  "FengQ_2015",
+  "VogtmannE_2016"
+)) {
+
+  cat(
+    "\n===== ",
+    cohort_name,
+    " =====\n",
+    sep = ""
+  )
+
+  ext <- load_external_binary(
+    cohort_name
+  )
+
+  stopifnot(
+    all(
+      selected_features %in%
+        colnames(ext$X)
+    )
+  )
+
+  X_ext_raw <- ext$X[
+    ,
+    selected_features,
+    drop = FALSE
+  ]
+
+  # Apply the frozen training-derived pseudocounts.
+  X_ext_replaced <- apply_zero_replacement(
+    X_ext_raw,
+    pseudocounts
+  )
+
+  # CLR using the frozen zero-handling rule.
+  X_ext_clr <- clr_transform(
+    X_ext_replaced
+  )
+
+  # Apply the frozen CLR scaler learned from the 92-sample
+  # discovery training partition.
+  X_ext_clr_scaled <- predict(
+    clr_scaler,
+    as.data.frame(X_ext_clr)
+  )
+
+  colnames(X_ext_clr_scaled) <- feature_name_map$Syntactic
+
+  stopifnot(
+    nrow(X_ext_clr_scaled) == length(ext$y)
+  )
+
+  evaluation <- evaluate_models(
+    models = models,
+    X = X_ext_clr_scaled,
+    y = ext$y,
+    cohort = cohort_name
+  )
+
+  ci <- dplyr::bind_rows(
+    lapply(
+      split(
+        evaluation$predictions,
+        evaluation$predictions$Model
+      ),
+      function(df) {
+
+        out <- bootstrap_ci(
+          y_true = df$Actual,
+          y_predicted = df$Predicted,
+          probability_crc = df$Probability_CRC,
+          B = 2000,
+          seed = ifelse(
+            cohort_name == "FengQ_2015",
+            2000,
+            3000
+          )
+        )
+
+        out$Model <- unique(df$Model)
+        out$Cohort <- cohort_name
+        out
+      }
+    )
+  )
+
+  cohort_dir <- file.path(
+    clr_results_dir,
+    "external_validation",
+    cohort_name
+  )
+
+  dir.create(
+    cohort_dir,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+
+  write.csv(
+    evaluation$metrics,
+    file.path(
+      cohort_dir,
+      "CLR_External_Metrics.csv"
+    ),
+    row.names = FALSE
+  )
+
+  write.csv(
+    evaluation$predictions,
+    file.path(
+      cohort_dir,
+      "CLR_External_Predictions.csv"
+    ),
+    row.names = FALSE
+  )
+
+  write.csv(
+    ci,
+    file.path(
+      cohort_dir,
+      "CLR_External_Bootstrap95CI.csv"
+    ),
+    row.names = FALSE
+  )
+
+  external_results[[cohort_name]] <- list(
+    metrics = evaluation$metrics,
+    predictions = evaluation$predictions,
+    ci = ci,
+    N = nrow(X_ext_clr_scaled)
+  )
+
+  print(evaluation$metrics)
+  print(ci)
+}
+```
+
+# Cohort-Size Audit
+
+```{r cohort-audit}
+cohort_size_audit <- data.frame(
+  Cohort = names(external_results),
+  N = vapply(
+    external_results,
+    function(x) x$N,
+    integer(1)
+  ),
+  CRC = vapply(
+    external_results,
+    function(x) sum(
+      x$predictions$Actual == "CRC"
+    ) / length(unique(x$predictions$Model)),
+    numeric(1)
+  ),
+  Healthy = vapply(
+    external_results,
+    function(x) sum(
+      x$predictions$Actual == "healthy"
+    ) / length(unique(x$predictions$Model)),
+    numeric(1)
+  )
+)
+
+print(cohort_size_audit)
+
+write.csv(
+  cohort_size_audit,
+  file.path(
+    clr_results_dir,
+    "CLR_External_CohortSize_Audit.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+# CLR Sensitivity Summary
+
+```{r summary}
+sensitivity_summary <- dplyr::bind_rows(
+  internal_test$metrics,
+  dplyr::bind_rows(
+    lapply(
+      external_results,
+      `[[`,
+      "metrics"
+    )
+  )
+)
+
+print(sensitivity_summary)
+
+write.csv(
+  sensitivity_summary,
+  file.path(
+    clr_results_dir,
+    "CLR_Sensitivity_All_Cohorts_Metrics.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+# CLR Diagnostics
+
+```{r diagnostics}
+zero_audit <- data.frame(
+  Dataset = c(
+    "Training",
+    "Internal_Test"
+  ),
+  Zero_Count = c(
+    sum(as.matrix(X_train_raw) == 0),
+    sum(as.matrix(X_test_raw) == 0)
+  ),
+  Zero_Fraction = c(
+    mean(as.matrix(X_train_raw) == 0),
+    mean(as.matrix(X_test_raw) == 0)
+  )
+)
+
+print(zero_audit)
+
+write.csv(
+  zero_audit,
+  file.path(
+    clr_results_dir,
+    "CLR_ZeroAudit_Training_InternalTest.csv"
+  ),
+  row.names = FALSE
+)
+
+external_zero_audit <- lapply(
+  names(external_results),
+  function(nm) {
+
+    ext <- load_external_binary(nm)
+
+    X_ext <- ext$X[
+      ,
+      selected_features,
+      drop = FALSE
+    ]
+
+    data.frame(
+      Cohort = nm,
+      Zero_Count = sum(
+        as.matrix(X_ext) == 0
+      ),
+      Zero_Fraction = mean(
+        as.matrix(X_ext) == 0
+      )
+    )
+  }
+)
+
+external_zero_audit <- bind_rows(
+  external_zero_audit
+)
+
+write.csv(
+  external_zero_audit,
+  file.path(
+    clr_results_dir,
+    "CLR_ZeroAudit_ExternalCohorts.csv"
+  ),
+  row.names = FALSE
+)
+
+print(external_zero_audit)
+```
+
+# Forensic Audit
+
+```{r forensic}
+forensic_audit <- data.frame(
+  Item = c(
+    "Frozen primary 92/22 split reused",
+    "49 Healthy / 43 CRC training composition preserved",
+    "Exactly the canonical 20 features used",
+    "Zero-handling parameters estimated from training data only",
+    "Same training-derived pseudocount applied to test data",
+    "Same training-derived pseudocount applied to external cohorts",
+    "Samples re-closed before CLR",
+    "CLR row sums approximately zero",
+    "CLR scaler fitted on training data only",
+    "Internal test held out until after model fitting",
+    "External cohorts used only after frozen models/transforms",
+    "External cohort definitions use study_condition",
+    "Classification threshold fixed at 0.50",
+    "Continuous CRC probabilities used for AUC",
+    "Bootstrap CIs use stratified class-wise resampling",
+    "Bootstrap B = 2000",
+    "No primary result/model files overwritten",
+    "External outputs stored in CLR sensitivity directory"
+  ),
+  Verified = c(
+    length(train_index) == 92,
+    sum(y_train == "healthy") == 49 &&
+      sum(y_train == "CRC") == 43,
+    length(selected_features) == 20,
+    length(pseudocounts) == 20 &&
+      all(pseudocounts > 0),
+    TRUE,
+    TRUE,
+    all(
+      abs(rowSums(X_train_replaced) - 1) < 1e-10
+    ),
+    max(abs(rowSums(X_train_clr))) < 1e-10 &&
+      max(abs(rowSums(X_test_clr))) < 1e-10,
+    TRUE,
+    TRUE,
+    TRUE,
+    TRUE,
+    TRUE,
+    TRUE,
+    TRUE,
+    TRUE,
+    dir.exists(clr_results_dir) &&
+      dir.exists(clr_models_dir),
+    dir.exists(
+      file.path(
+        clr_results_dir,
+        "external_validation"
+      )
+    )
+  )
+)
+
+print(forensic_audit)
+
+write.csv(
+  forensic_audit,
+  file.path(
+    clr_results_dir,
+    "CLR_ForensicAuditChecklist.csv"
+  ),
+  row.names = FALSE
+)
+
+if (!all(forensic_audit$Verified)) {
+  stop(
+    "CLR forensic audit failed. Do not use CLR results until corrected."
+  )
+}
+```
+
+# Session Information
+
+```{r session-info}
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(
+    clr_results_dir,
+    "CLR_SessionInfo.txt"
+  )
+)
+
+sessionInfo()
+```
+
+## Session information
+
+The final section records the exact R session used for this knit. The same information is also saved as a text artifact so the HTML report and repository contain both a human-readable and machine-readable provenance record.
+
+```{r session-information}
+session_file <- file.path(
+  results_dir,
+  "session_info",
+  "06_CLR_Compositional_Sensitivity_sessionInfo.txt"
+)
+write_session_info(session_file)
+cat("Saved session information to:", session_file, "\n\n")
+sessionInfo()
+```

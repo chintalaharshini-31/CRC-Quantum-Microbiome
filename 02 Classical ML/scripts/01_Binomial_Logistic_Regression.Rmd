@@ -1,0 +1,1101 @@
+---
+title: "Binomial Logistic Regression for Colorectal Cancer Microbiome Classification"
+author: "Harshini Chintala"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    theme: cosmo
+    highlight: tango
+    df_print: paged
+    fig_caption: true
+    self_contained: true
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  collapse = TRUE,
+  comment = "##",
+  fig.width = 7.2,
+  fig.height = 5.2,
+  dpi = 300,
+  fig.align = "center",
+  out.width = "92%",
+  results = "markup"
+)
+
+options(width = 90, scipen = 999)
+source("../../R/project_setup.R")
+set.seed(1910)
+
+# Classical notebook output locations.
+project_dir <- classical_dir
+results_dir <- file.path(classical_dir, "results")
+models_dir <- file.path(classical_dir, "models")
+data_dir <- file.path(classical_dir, "data")
+reports_dir <- file.path(classical_dir, "reports")
+figures_dir <- file.path(classical_dir, "figures")
+for (d in c(results_dir, models_dir, data_dir, reports_dir, figures_dir)) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+
+```
+
+## Notebook roadmap
+
+**Purpose:** This notebook is one reproducible component of the CRC microbiome classification pipeline.
+
+**Execution order**
+1. Load the project environment and fixed random seed (`1910`).
+2. Load only the validated project artifacts required for this analysis.
+3. Perform the analysis exactly as documented below.
+4. Generate tables/figures and save machine-readable outputs.
+5. Record the session information used for the run.
+
+**Output contract:** generated tables, figures, model objects, audit files, and session information are written under `02 Classical ML/results/`. The notebook itself renders to HTML with a floating table of contents, so the sections can be navigated from the left-hand panel in the knitted document.
+
+**Reproducibility rule:** this repository preserves the validated analysis logic and project-wide seed. Environment restoration is handled by `renv.lock` for R and `requirements.txt` for Python. The notebooks do not silently install unpinned packages during knitting.
+
+### Reproducibility constants
+
+- Project seed: **1910**
+- Discovery cohort: **ZellerG_2014**
+- Primary task: **Healthy vs CRC; adenoma excluded**
+- Frozen discovery split: **92 training / 22 held-out test samples**
+- Primary feature panel: **20 Boruta-selected features**
+- External cohorts: **FengQ_2015** and **VogtmannE_2016**
+
+# Load Dataset
+
+
+```{r}
+# ==========================================================
+# Load Dataset
+# ==========================================================
+
+library(curatedMetagenomicData)
+library(TreeSummarizedExperiment)
+library(tidyverse)
+library(dplyr)
+library(caret)
+library(Boruta)
+library(pROC)
+
+# Download/load Zeller dataset
+zeller <- curatedMetagenomicData(
+  "ZellerG_2014.relative_abundance",
+  dryrun = FALSE
+)[[1]]
+
+# Extract abundance matrix
+abundance <- assay(zeller)
+
+# Transpose:
+# Rows = samples
+# Columns = microbial species
+X <- as.data.frame(t(abundance))
+
+# Disease labels
+y <- colData(zeller)$study_condition
+
+# Combine into one dataframe
+crc_data <- X
+crc_data$disease <- y
+
+# Check dimensions
+dim(crc_data)
+
+# Class distribution
+table(crc_data$disease)
+```
+
+# Create Binary Dataset
+
+```{r}
+# 2. Create Binary Dataset
+# ========================
+binary_data <- crc_data %>%
+  # 1. Rename "control" to "healthy" before filtering
+  mutate(disease = case_match(disease, "control" ~ "healthy", .default = disease)) %>% 
+  # 2. Filter down to your desired classes
+  filter(disease %in% c("healthy", "CRC"))
+
+# 3. Clean up the factor levels so "adenoma" is removed completely
+binary_data$disease <- factor(binary_data$disease)
+
+table(binary_data$disease)
+
+```
+
+
+# Train-Test Split
+
+```{r}
+# ==========================================================
+# Shared Train-Test Split
+# ==========================================================
+
+train_index_path <- file.path(
+  models_dir,
+  "BinaryClass_Train_Index.rds"
+)
+
+if (file.exists(train_index_path)) {
+
+  train_index <- readRDS(train_index_path)
+
+} else {
+
+  set.seed(1910)
+
+  train_index <- createDataPartition(
+    binary_data$disease,
+    p = 0.80,
+    list = FALSE
+  )
+
+  saveRDS(
+    train_index,
+    train_index_path
+  )
+}
+
+train_data <- binary_data[train_index, ]
+test_data  <- binary_data[-train_index, ]
+
+cat("Training samples :", nrow(train_data), "\n")
+cat("Testing samples  :", nrow(test_data), "\n")
+
+table(train_data$disease)
+table(test_data$disease)
+
+
+```
+
+
+```{r}
+#==========================================================
+# Prepare Predictor Matrix
+#==========================================================
+
+X_train_raw <- train_data %>%
+  dplyr::select(-disease)
+
+X_test_raw <- test_data %>%
+  dplyr::select(-disease)
+
+y_train <- train_data$disease
+y_test <- test_data$disease
+```
+
+# Near-Zero Variance Filtering
+
+```{r}
+#==========================================================
+# Near-Zero Variance Filtering
+#==========================================================
+
+# Detect near-zero variance features ONLY on training data
+nzv <- nearZeroVar(X_train_raw)
+
+cat("Near-zero variance features removed:", length(nzv), "\n")
+
+# Remove the same columns from train and test
+X_train_nzv <- X_train_raw[, -nzv, drop = FALSE]
+X_test_nzv  <- X_test_raw[, -nzv, drop = FALSE]
+
+cat("Remaining features:", ncol(X_train_nzv), "\n")
+```
+
+# Feature Selection using Boruta
+
+```{r}
+#---------------------------------------------------------------
+# Feature Selection using Boruta
+#---------------------------------------------------------------
+
+set.seed(1910)
+
+boruta_data <- data.frame(
+  Disease = y_train,
+  X_train_nzv,
+  check.names = FALSE
+)
+
+boruta_model <- Boruta(
+  Disease ~ .,
+  data = boruta_data,
+  doTrace = 2
+)
+
+boruta_final <- TentativeRoughFix(boruta_model)
+
+selected_features <- getSelectedAttributes(
+  boruta_final,
+  withTentative = FALSE
+)
+
+# ==========================================================
+# Save Canonical Shared Binary Feature List
+# ==========================================================
+
+canonical_feature_list <- data.frame(
+  Feature = selected_features,
+  stringsAsFactors = FALSE
+)
+
+write.csv(
+  canonical_feature_list,
+  file.path(
+    results_dir,
+    "Binary_Selected_20_Features.csv"
+  ),
+  row.names = FALSE
+)
+
+cat(
+  "Canonical shared binary feature list saved successfully.\n"
+)
+
+cat("Number of selected features:",
+    length(selected_features), "\n")
+
+stopifnot(length(selected_features) == 20)
+
+print(selected_features)
+
+X_train_boruta <- X_train_nzv[, selected_features, drop = FALSE]
+X_test_boruta  <- X_test_nzv[, selected_features, drop = FALSE]
+```
+
+```{r}
+saveRDS(
+  boruta_model,
+  file.path(
+    models_dir,
+    "Boruta_Model.rds"
+  )
+)
+
+cat("Boruta model saved successfully.\n")
+```
+
+
+# Feature Scaling
+
+```{r}
+# ==========================================================
+# Feature Scaling
+# ==========================================================
+
+# Learn scaling parameters ONLY from training data
+scaler <- preProcess(
+  X_train_boruta,
+  method = c("center", "scale")
+)
+
+X_train_scaled <- predict(scaler, X_train_boruta)
+X_test_scaled  <- predict(scaler, X_test_boruta)
+
+ncol(X_test_scaled)
+
+head(colnames(X_test_scaled))
+
+anyDuplicated(colnames(X_test_scaled))
+
+cat("Training data scaled successfully.\n")
+cat("Testing data scaled successfully.\n")
+```
+
+
+```{r}
+saveRDS(
+  scaler,
+  file.path(
+    models_dir,
+    "Scaler.rds"
+  )
+)
+
+cat("Scaler saved successfully.\n")
+```
+
+```{r}
+#===============================================================
+# Standardize Feature Names
+#===============================================================
+
+colnames(X_train_scaled) <- make.names(colnames(X_train_scaled))
+colnames(X_test_scaled)  <- make.names(colnames(X_test_scaled))
+
+cat("Feature names standardized successfully.\n")
+```
+
+
+# Repeated Stratified Cross-Validation
+
+```{r}
+
+# ===============================================================
+# Shared Repeated Stratified Cross-Validation
+# ===============================================================
+
+cv_folds_path <- file.path(
+  models_dir,
+  "BinaryClass_CV_Folds.rds"
+)
+
+if (file.exists(cv_folds_path)) {
+
+  cv_folds <- readRDS(cv_folds_path)
+
+} else {
+
+  set.seed(1910)
+
+  cv_folds <- createMultiFolds(
+    y_train,
+    k = 10,
+    times = 5
+  )
+
+  saveRDS(
+    cv_folds,
+    cv_folds_path
+  )
+}
+
+shared_cv_control <- trainControl(
+  method = "repeatedcv",
+  number = 10,
+  repeats = 5,
+  index = cv_folds,
+  classProbs = TRUE,
+  savePredictions = "final",
+  summaryFunction = twoClassSummary
+)
+
+```
+
+```{r}
+#===============================================================
+# Train Binary Logistic Regression
+#===============================================================
+
+train_data <- data.frame(
+  Disease = y_train,
+  X_train_scaled,
+  check.names = FALSE
+)
+set.seed(1910)
+
+logistic_model <- caret::train(
+  Disease ~ .,
+  data = train_data,
+  method = "glm",
+  family = binomial(),
+  metric = "ROC",
+  trControl = shared_cv_control
+)
+
+logistic_model
+```
+
+
+```{r}
+#===============================================================
+# Prepare Test Data
+#===============================================================
+
+test_model_data <- data.frame(
+  X_test_scaled,
+  check.names = FALSE
+)
+```
+
+# Cross-Validation Results
+
+```{r}
+#===============================================================
+# Cross-Validation Results
+#===============================================================
+
+print(logistic_model)
+
+logistic_model$results
+
+cv_results <- logistic_model$results
+
+write.csv(
+    cv_results,
+    file.path(
+        results_dir,
+        "BinomialLR_CrossValidation.csv"
+    ),
+    row.names = FALSE
+)
+```
+
+
+# Variance Inflation Factor (VIF)
+
+```{r}
+#===============================================================
+# Variance Inflation Factor (VIF)
+#===============================================================
+
+vif_values <- car::vif(logistic_model$finalModel)
+
+
+vif_table <- data.frame(
+  Feature = names(vif_values),
+  VIF = vif_values
+)
+
+vif_table
+
+write.csv(
+  vif_table,
+  file.path(
+    results_dir,
+    "BinomialLR_VIF.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+# Predict Probabilities
+
+```{r}
+#===============================================================
+# Predict Probabilities
+#===============================================================
+
+prob_predictions <- predict(
+  logistic_model,
+  newdata = X_test_scaled,
+  type = "prob"
+)
+
+head(prob_predictions)
+
+summary(prob_predictions)
+```
+
+
+# Convert Probabilities to Predicted Classes
+
+```{r}
+#===============================================================
+# Predict Classes
+#===============================================================
+
+predicted_class <- predict(
+  logistic_model,
+  newdata = X_test_scaled,
+  type = "raw"
+)
+
+head(predicted_class)
+
+table(predicted_class)
+```
+
+```{r}
+#===============================================================
+# Save Predictions
+#===============================================================
+
+prediction_results <- data.frame(
+  SampleID = rownames(test_data),
+  Actual = y_test,
+  Predicted = predicted_class,
+  Probability_CRC = prob_predictions$CRC,
+  Probability_Healthy = prob_predictions$healthy,
+  row.names = NULL
+)
+head(prediction_results)
+
+write.csv(
+  prediction_results,
+  file.path(
+    results_dir,
+    "BinomialLR_Predictions.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("Predictions saved successfully.\n")
+```
+
+# Confusion Matrix
+
+```{r}
+#===============================================================
+# Confusion Matrix
+#===============================================================
+
+confusion_matrix <- confusionMatrix(
+  predicted_class,
+  y_test,
+  positive = "CRC"
+)
+
+confusion_matrix
+```
+
+```{r}
+#===============================================================
+# Save Confusion Matrix
+#===============================================================
+
+capture.output(
+  confusion_matrix,
+  file = file.path(
+    results_dir,
+    "BinomialLR_ConfusionMatrix.txt"
+  )
+)
+
+cat("Confusion matrix saved successfully.\n")
+```
+
+# Confusion Matrix Heatmap
+
+```{r}
+#===============================================================
+# Confusion Matrix Heatmap
+#===============================================================
+
+confusion_df <- as.data.frame(confusion_matrix$table)
+
+ggplot(confusion_df, aes(
+  x = Prediction,
+  y = Reference,
+  fill = Freq
+)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 6) +
+  scale_fill_gradient(
+    low = "white",
+    high = "steelblue"
+  ) +
+  labs(
+    title = "Binary Logistic Regression Confusion Matrix",
+    x = "Predicted Class",
+    y = "Actual Class"
+  ) +
+  theme_minimal()
+
+ggsave(
+  filename = file.path(
+    figures_dir,
+    "BinomialLR_ConfusionMatrixHeatmap.png"
+  ),
+  width = 6,
+  height = 5,
+  dpi = 300
+)
+```
+
+# Overall Metrics
+
+```{r}
+#===============================================================
+# Overall Evaluation Metrics
+#===============================================================
+
+overall_metrics <- data.frame(
+  Accuracy = confusion_matrix$overall["Accuracy"],
+  Kappa = confusion_matrix$overall["Kappa"],
+  AccuracyLower = confusion_matrix$overall["AccuracyLower"],
+  AccuracyUpper = confusion_matrix$overall["AccuracyUpper"],
+  AccuracyPValue = confusion_matrix$overall["AccuracyPValue"],
+  McNemarPValue = confusion_matrix$overall["McnemarPValue"]
+)
+
+overall_metrics
+
+write.csv(
+  overall_metrics,
+  file.path(
+    results_dir,
+    "BinomialLR_OverallMetrics.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("Overall metrics saved successfully.\n")
+```
+
+# Class-wise Metrics
+
+
+```{r}
+#===============================================================
+# Class-wise Evaluation Metrics
+#===============================================================
+
+class_metrics <- as.data.frame(
+  confusion_matrix$byClass
+)
+
+class_metrics$Metric <- rownames(class_metrics)
+
+rownames(class_metrics) <- NULL
+
+class_metrics
+
+write.csv(
+  class_metrics,
+  file.path(
+    results_dir,
+    "BinomialLR_ClassMetrics.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("Class-wise metrics saved successfully.\n")
+```
+
+# Matthews Correlation Coefficient (MCC)
+
+```{r}
+#===============================================================
+# Matthews Correlation Coefficient (MCC)
+#===============================================================
+
+mcc_data <- data.frame(
+  truth = y_test,
+  prediction = predicted_class
+)
+
+mcc_value <- yardstick::mcc(
+  mcc_data,
+  truth = truth,
+  estimate = prediction
+)
+
+mcc_value
+```
+
+```{r}
+write.csv(
+  mcc_value,
+  file.path(
+    results_dir,
+    "BinomialLR_MCC.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("MCC saved successfully.\n")
+```
+
+
+# ROC Curve
+
+```{r}
+#===============================================================
+# ROC Curve
+#===============================================================
+
+roc_curve <- roc(
+  response = y_test,
+  predictor = prob_predictions$CRC,
+  levels = c("healthy", "CRC")
+)
+plot(
+  roc_curve,
+  col = "blue",
+  lwd = 2,
+  main = "Binary Logistic Regression ROC Curve"
+)
+
+abline(
+  a = 0,
+  b = 1,
+  lty = 2,
+  col = "red"
+)
+```
+
+```{r}
+
+png(file.path(figures_dir, "ROC_Curve.png"), width = 15, height = 10, units = "in", res = 300)
+
+plot(roc_curve) 
+
+dev.off()
+
+```
+
+# AUC
+
+```{r}
+#===============================================================
+# AUC
+#===============================================================
+auc_value <- auc(roc_curve)
+
+auc_results <- data.frame(
+  AUC = as.numeric(auc_value)
+)
+
+write.csv(
+  auc_results,
+  file.path(
+    results_dir,
+    "BinomialLR_AUC.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("AUC saved successfully.\n")
+```
+
+
+# ROC Coordinates
+
+```{r}
+#===============================================================
+# ROC Coordinates
+#===============================================================
+roc_coordinates <- data.frame(
+  Specificity = roc_curve$specificities,
+  Sensitivity = roc_curve$sensitivities,
+  Threshold = roc_curve$thresholds
+)
+
+write.csv(
+  roc_coordinates,
+  file.path(
+    results_dir,
+    "BinomialLR_ROC_Coordinates.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("ROC coordinates saved successfully.\n")
+```
+
+
+# Logistic Regression Coefficients
+
+```{r}
+#===============================================================
+# Logistic Regression Coefficients
+#===============================================================
+
+coefficients_table <- summary(logistic_model)$coefficients
+
+coefficients_table
+```
+
+```{r}
+#===============================================================
+# Extract Model Coefficients
+#===============================================================
+
+coefficients_df <- data.frame(
+  Feature = names(coef(logistic_model$finalModel)),
+  Estimate = coef(logistic_model$finalModel)
+)
+
+# Remove intercept
+coefficients_df <- coefficients_df[
+  coefficients_df$Feature != "(Intercept)",
+]
+
+coefficients_df
+```
+
+```{r}
+write.csv(
+  coefficients_df,
+  file.path(
+    results_dir,
+    "BinomialLR_Coefficients.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("Coefficient table saved successfully.\n")
+```
+
+# Calculate Odds Ratios
+
+```{r}
+#===============================================================
+# Calculate Odds Ratios
+#===============================================================
+
+coefficients_df$OddsRatio <- exp(coefficients_df$Estimate)
+
+coefficients_df
+```
+
+# Sort by Absolute Effect
+
+```{r}
+#===============================================================
+# Sort Features by Effect Size
+#===============================================================
+
+coefficients_df <- coefficients_df[
+  order(abs(coefficients_df$Estimate),
+        decreasing = TRUE),
+]
+
+head(coefficients_df, 20)
+```
+
+
+# Logistic Regression Coefficient Plot
+
+
+```{r}
+
+# ================================================================
+# Logistic Regression Coefficients and Top Biomarkers
+# ================================================================
+
+# Extract coefficients from the final fitted logistic model
+coefficients_df <- data.frame(
+  Feature = names(coef(logistic_model$finalModel)),
+  Estimate = as.numeric(coef(logistic_model$finalModel)),
+  stringsAsFactors = FALSE
+)
+
+# Remove intercept
+coefficients_df <- coefficients_df[
+  coefficients_df$Feature != "(Intercept)",
+  ,
+  drop = FALSE
+]
+
+# Calculate odds ratios
+coefficients_df$OddsRatio <- exp(coefficients_df$Estimate)
+
+# ================================================================
+# Extract Genus + Species names
+# ================================================================
+
+extract_microbe_name <- function(x) {
+
+  genus <- stringr::str_match(
+    x,
+    "g__([^.|]+)"
+  )[, 2]
+
+  species <- stringr::str_match(
+    x,
+    "s__([^.|]+)"
+  )[, 2]
+
+  if (
+    !is.na(genus) &&
+    !is.na(species)
+  ) {
+    return(
+      paste(
+        genus,
+        species
+      )
+    )
+  }
+
+  # Fallback to original feature name
+  return(x)
+}
+
+coefficients_df$Microbe <- vapply(
+  coefficients_df$Feature,
+  extract_microbe_name,
+  character(1)
+)
+
+# ================================================================
+# Rank features by absolute coefficient magnitude
+# ================================================================
+
+coefficients_df <- coefficients_df[
+  order(
+    abs(coefficients_df$Estimate),
+    decreasing = TRUE
+  ),
+  ,
+  drop = FALSE
+]
+
+coefficients_df$Rank <- seq_len(
+  nrow(coefficients_df)
+)
+
+# ================================================================
+# Save complete coefficient table
+# ================================================================
+
+write.csv(
+  coefficients_df,
+  file.path(
+    results_dir,
+    "BinomialLR_Coefficients.csv"
+  ),
+  row.names = FALSE
+)
+
+# ================================================================
+# Extract Top 20 Biomarkers
+# ================================================================
+
+top20_biomarkers <- head(
+  coefficients_df,
+  20
+)
+
+top20_biomarkers$Direction <- ifelse(
+  top20_biomarkers$Estimate > 0,
+  "Positive",
+  "Negative"
+)
+
+# Save dedicated Top-20 biomarker table
+write.csv(
+  top20_biomarkers,
+  file.path(
+    results_dir,
+    "BinomialLR_Top20Biomarkers.csv"
+  ),
+  row.names = FALSE
+)
+
+# ================================================================
+# Create Top-20 coefficient plot
+# ================================================================
+
+coefficient_plot <- ggplot(
+  top20_biomarkers,
+  aes(
+    x = reorder(
+      Microbe,
+      abs(Estimate)
+    ),
+    y = Estimate,
+    fill = Direction
+  )
+) +
+
+  geom_col(
+    width = 0.70
+  ) +
+
+  coord_flip() +
+
+  labs(
+    title = "Top 20 Logistic Regression Coefficients",
+    subtitle = "Ranked by absolute coefficient magnitude",
+    x = "Microbial taxon",
+    y = "Logistic regression coefficient"
+  ) +
+
+  theme_minimal(
+    base_size = 12
+  ) +
+
+  theme(
+    legend.title = element_blank(),
+    axis.text.y = element_text(
+      size = 9
+    )
+  )
+
+# Display in knitted HTML
+print(coefficient_plot)
+
+# ================================================================
+# Save publication-quality figure
+# ================================================================
+
+ggsave(
+  filename = file.path(
+    figures_dir,
+    "BinomialLR_Coefficients.png"
+  ),
+  plot = coefficient_plot,
+  width = 9,
+  height = 7,
+  dpi = 300
+)
+
+cat(
+  "Logistic regression coefficient table, Top-20 biomarker table, ",
+  "and coefficient plot saved successfully.\n"
+)
+```
+
+
+
+# Save Trained Model
+
+```{r}
+#===============================================================
+# Save Trained Model
+#===============================================================
+
+saveRDS(
+  logistic_model,
+  file.path(
+    models_dir,
+    "BinomialLR_Model.rds"
+  )
+)
+file.exists(
+  file.path(
+    models_dir,
+    "BinomialLR_Model.rds"
+  )
+)
+
+cat("Model saved successfully.\n")
+```
+
+
+# Session Information
+
+```{r}
+#===============================================================
+# Session Information
+#===============================================================
+
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(
+    reports_dir,
+    "BinomialLR_SessionInfo.txt"
+  )
+)
+
+sessionInfo()
+```
+
+## Session information
+
+The final section records the exact R session used for this knit. The same information is also saved as a text artifact so the HTML report and repository contain both a human-readable and machine-readable provenance record.
+
+```{r session-information}
+session_file <- file.path(
+  results_dir,
+  "session_info",
+  "01_Binomial_Logistic_Regression_sessionInfo.txt"
+)
+write_session_info(session_file)
+cat("Saved session information to:", session_file, "\n\n")
+sessionInfo()
+```

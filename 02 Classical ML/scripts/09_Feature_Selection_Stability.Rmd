@@ -1,0 +1,1332 @@
+---
+title: "Feature Selection Stability Analysis"
+author: "Harshini Chintala"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    theme: cosmo
+    highlight: tango
+    df_print: paged
+    fig_caption: true
+    self_contained: true
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  collapse = TRUE,
+  comment = "##",
+  fig.width = 7.2,
+  fig.height = 5.2,
+  dpi = 300,
+  fig.align = "center",
+  out.width = "92%",
+  results = "markup"
+)
+
+options(width = 90, scipen = 999)
+source("../../R/project_setup.R")
+set.seed(1910)
+
+# Classical notebook output locations.
+project_dir <- classical_dir
+results_dir <- file.path(classical_dir, "results")
+models_dir <- file.path(classical_dir, "models")
+data_dir <- file.path(classical_dir, "data")
+reports_dir <- file.path(classical_dir, "reports")
+figures_dir <- file.path(classical_dir, "figures")
+for (d in c(results_dir, models_dir, data_dir, reports_dir, figures_dir)) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+
+#load packages
+library(dplyr)
+library(caret)
+library(Boruta)
+library(randomForest)
+library(ggplot2)
+
+```
+
+## Notebook roadmap
+
+**Purpose:** This notebook is one reproducible component of the CRC microbiome classification pipeline.
+
+**Execution order**
+1. Load the project environment and fixed random seed (`1910`).
+2. Load only the validated project artifacts required for this analysis.
+3. Perform the analysis exactly as documented below.
+4. Generate tables/figures and save machine-readable outputs.
+5. Record the session information used for the run.
+
+**Output contract:** generated tables, figures, model objects, audit files, and session information are written under `02 Classical ML/results/`. The notebook itself renders to HTML with a floating table of contents, so the sections can be navigated from the left-hand panel in the knitted document.
+
+**Reproducibility rule:** this repository preserves the validated analysis logic and project-wide seed. Environment restoration is handled by `renv.lock` for R and `requirements.txt` for Python. The notebooks do not silently install unpinned packages during knitting.
+
+### Reproducibility constants
+
+- Project seed: **1910**
+- Discovery cohort: **ZellerG_2014**
+- Primary task: **Healthy vs CRC; adenoma excluded**
+- Frozen discovery split: **92 training / 22 held-out test samples**
+- Primary feature panel: **20 Boruta-selected features**
+- External cohorts: **FengQ_2015** and **VogtmannE_2016**
+
+# 1. Packages and Project Paths
+
+```{r}
+# ==========================================================
+# PACKAGES
+# ==========================================================
+
+library(curatedMetagenomicData)
+library(TreeSummarizedExperiment)
+library(SummarizedExperiment)
+library(caret)
+library(Boruta)
+library(dplyr)
+library(ggplot2)
+
+# ==========================================================
+# REPRODUCIBILITY
+# ==========================================================
+
+set.seed(1910)
+
+# ==========================================================
+# PROJECT PATHS
+# ==========================================================
+
+project_dir <- classical_dir
+
+models_dir <- file.path(
+  project_dir,
+  "models"
+)
+
+results_dir <- file.path(
+  project_dir,
+  "results"
+)
+
+figures_dir <- file.path(
+  project_dir,
+  "figures"
+)
+
+stability_dir <- file.path(
+  results_dir,
+  "feature_selection_stability"
+)
+
+dir.create(
+  stability_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+dir.create(
+  figures_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+cat("Project directory:\n", project_dir, "\n")
+cat("Models directory:\n", models_dir, "\n")
+cat("Results directory:\n", results_dir, "\n")
+cat("Stability output directory:\n", stability_dir, "\n")
+```
+
+# 2. Load the Exact Discovery Training Set
+
+```{r}
+# ==========================================================
+# LOAD SHARED TRAIN-TEST SPLIT
+# ==========================================================
+
+train_index_path <- file.path(
+  models_dir,
+  "BinaryClass_Train_Index.rds"
+)
+
+if (!file.exists(train_index_path)) {
+  stop(
+    "Shared train-test index not found:\n",
+    train_index_path
+  )
+}
+
+train_index <- readRDS(
+  train_index_path
+)
+
+# ==========================================================
+# LOAD ZELLER DATASET
+# ==========================================================
+
+zeller <- curatedMetagenomicData(
+  "ZellerG_2014.relative_abundance",
+  dryrun = FALSE
+)[[1]]
+
+abundance <- assay(zeller)
+
+# Original:
+# rows = microbial features
+# columns = samples
+#
+# Transpose to:
+# rows = samples
+# columns = microbial features
+
+abundance_df <- as.data.frame(
+  t(abundance),
+  check.names = FALSE
+)
+
+# ==========================================================
+# BUILD BINARY OUTCOME
+# ==========================================================
+
+metadata <- as.data.frame(
+  colData(zeller)
+)
+
+disease_raw <- metadata$disease
+
+disease <- factor(
+  ifelse(
+    disease_raw == "control",
+    "healthy",
+    as.character(disease_raw)
+  ),
+  levels = c("healthy", "CRC")
+)
+
+# Keep only Healthy and CRC
+binary_keep <- disease %in% c(
+  "healthy",
+  "CRC"
+)
+
+binary_data <- abundance_df[
+  binary_keep,
+  ,
+  drop = FALSE
+]
+
+disease_binary <- droplevels(
+  disease[binary_keep]
+)
+
+# ==========================================================
+# VERIFY SHARED TRAINING SET
+# ==========================================================
+
+if (max(train_index) > nrow(binary_data)) {
+  stop(
+    "Shared train index contains row numbers outside the binary dataset."
+  )
+}
+
+X_train_raw <- binary_data[
+  train_index,
+  ,
+  drop = FALSE
+]
+
+y_train <- disease_binary[
+  train_index
+]
+
+if (nrow(X_train_raw) != 92) {
+  stop(
+    "Expected 92 training samples but found ",
+    nrow(X_train_raw)
+  )
+}
+
+cat(
+  "Training samples:",
+  nrow(X_train_raw),
+  "\n"
+)
+
+cat(
+  "Training features:",
+  ncol(X_train_raw),
+  "\n"
+)
+
+cat(
+  "\nTraining class distribution:\n"
+)
+
+print(
+  table(y_train)
+)
+```
+
+
+# 3. Load the Original 20 Discovery Features
+
+```{r}
+# ==========================================================
+# ORIGINAL DISCOVERY FEATURE SET
+# ==========================================================
+
+original_features_path <- file.path(
+  results_dir,
+  "Binary_Selected_20_Features.csv"
+)
+
+if (!file.exists(original_features_path)) {
+  stop(
+    "Original 20-feature file not found:\n",
+    original_features_path
+  )
+}
+
+original_features <- read.csv(
+  original_features_path,
+  stringsAsFactors = FALSE
+)[[1]]
+
+if (length(original_features) != 20) {
+  stop(
+    "Expected exactly 20 original features but found ",
+    length(original_features)
+  )
+}
+
+missing_original_features <- setdiff(
+  original_features,
+  colnames(X_train_raw)
+)
+
+if (length(missing_original_features) > 0) {
+  stop(
+    "Original discovery features missing from training data:\n",
+    paste(
+      missing_original_features,
+      collapse = "\n"
+    )
+  )
+}
+
+cat(
+  "Original discovery feature count:",
+  length(original_features),
+  "\n"
+)
+
+print(
+  original_features
+)
+```
+
+
+# 4. One Pilot Subsample
+
+```{r}
+# ==========================================================
+# PILOT STRATIFIED SUBSAMPLE
+# ==========================================================
+
+set.seed(1910)
+
+healthy_idx <- which(
+  y_train == "healthy"
+)
+
+crc_idx <- which(
+  y_train == "CRC"
+)
+
+# 80% of each class, without replacement
+n_healthy_sub <- floor(
+  length(healthy_idx) * 0.80
+)
+
+n_crc_sub <- floor(
+  length(crc_idx) * 0.80
+)
+
+pilot_healthy <- sample(
+  healthy_idx,
+  size = n_healthy_sub,
+  replace = FALSE
+)
+
+pilot_crc <- sample(
+  crc_idx,
+  size = n_crc_sub,
+  replace = FALSE
+)
+
+pilot_idx <- c(
+  pilot_healthy,
+  pilot_crc
+)
+
+X_pilot <- X_train_raw[
+  pilot_idx,
+  ,
+  drop = FALSE
+]
+
+y_pilot <- y_train[
+  pilot_idx
+]
+
+cat(
+  "Pilot sample size:",
+  nrow(X_pilot),
+  "\n"
+)
+
+cat(
+  "Pilot class distribution:\n"
+)
+
+print(
+  table(y_pilot)
+)
+
+# ==========================================================
+# NZV FILTERING
+# ==========================================================
+
+pilot_nzv <- nearZeroVar(
+  X_pilot
+)
+
+if (length(pilot_nzv) > 0) {
+
+  X_pilot_nzv <- X_pilot[
+    ,
+    -pilot_nzv,
+    drop = FALSE
+  ]
+
+} else {
+
+  X_pilot_nzv <- X_pilot
+
+}
+
+cat(
+  "Features after NZV:",
+  ncol(X_pilot_nzv),
+  "\n"
+)
+
+# ==========================================================
+# BORUTA
+# ==========================================================
+
+pilot_boruta_data <- data.frame(
+  Disease = y_pilot,
+  X_pilot_nzv,
+  check.names = FALSE
+)
+
+pilot_boruta <- Boruta(
+  Disease ~ .,
+  data = pilot_boruta_data,
+  doTrace = 0
+)
+
+pilot_boruta_final <- TentativeRoughFix(
+  pilot_boruta
+)
+
+pilot_selected <- getSelectedAttributes(
+  pilot_boruta_final,
+  withTentative = FALSE
+)
+
+cat(
+  "Features selected in pilot:",
+  length(pilot_selected),
+  "\n"
+)
+
+pilot_overlap <- intersect(
+  original_features,
+  pilot_selected
+)
+
+cat(
+  "Original 20 recovered in pilot:",
+  length(pilot_overlap),
+  "/ 20\n"
+)
+```
+
+
+# 5. 200-Iteration Feature-Selection Stability Analysis
+
+```{r}
+# ==========================================================
+# FEATURE-SELECTION STABILITY ANALYSIS
+# 200 STRATIFIED SUBSAMPLING ITERATIONS
+# ==========================================================
+
+set.seed(1910)
+
+n_iterations <- 200
+
+# ----------------------------------------------------------
+# Storage
+# ----------------------------------------------------------
+
+selected_features_list <- vector(
+  "list",
+  n_iterations
+)
+
+n_features_selected <- integer(
+  n_iterations
+)
+
+n_original_recovered <- integer(
+  n_iterations
+)
+
+iteration_warning_count <- integer(
+  n_iterations
+)
+
+iteration_warning_messages <- vector(
+  "list",
+  n_iterations
+)
+
+# ----------------------------------------------------------
+# Fixed class indices from the original training set
+# ----------------------------------------------------------
+
+healthy_idx <- which(
+  y_train == "healthy"
+)
+
+crc_idx <- which(
+  y_train == "CRC"
+)
+
+# ----------------------------------------------------------
+# Start iterations
+# ----------------------------------------------------------
+
+for (i in seq_len(n_iterations)) {
+
+  cat(
+    "\n========================================\n",
+    "Iteration:",
+    i,
+    "/",
+    n_iterations,
+    "\n",
+    "========================================\n"
+  )
+
+  # --------------------------------------------------------
+  # STRATIFIED SUBSAMPLING WITHOUT REPLACEMENT
+  # --------------------------------------------------------
+
+  n_healthy_sub <- floor(
+    length(healthy_idx) * 0.80
+  )
+
+  n_crc_sub <- floor(
+    length(crc_idx) * 0.80
+  )
+
+  sub_healthy <- sample(
+    healthy_idx,
+    size = n_healthy_sub,
+    replace = FALSE
+  )
+
+  sub_crc <- sample(
+    crc_idx,
+    size = n_crc_sub,
+    replace = FALSE
+  )
+
+  sub_idx <- c(
+    sub_healthy,
+    sub_crc
+  )
+
+  X_sub <- X_train_raw[
+    sub_idx,
+    ,
+    drop = FALSE
+  ]
+
+  y_sub <- y_train[
+    sub_idx
+  ]
+
+  # --------------------------------------------------------
+  # NZV FILTERING
+  # --------------------------------------------------------
+
+  nzv_sub <- nearZeroVar(
+    X_sub
+  )
+
+  if (length(nzv_sub) > 0) {
+
+    X_sub_nzv <- X_sub[
+      ,
+      -nzv_sub,
+      drop = FALSE
+    ]
+
+  } else {
+
+    X_sub_nzv <- X_sub
+
+  }
+
+  # --------------------------------------------------------
+  # BORUTA
+  #
+  # Warning messages are captured and recorded rather than
+  # silently flooding the console.
+  # --------------------------------------------------------
+
+  iteration_warnings <- character(
+    0
+  )
+
+  boruta_result <- withCallingHandlers(
+
+    {
+
+      boruta_data <- data.frame(
+        Disease = y_sub,
+        X_sub_nzv,
+        check.names = FALSE
+      )
+
+      boruta_model <- Boruta(
+        Disease ~ .,
+        data = boruta_data,
+        doTrace = 0
+      )
+
+      boruta_final <- TentativeRoughFix(
+        boruta_model
+      )
+
+      getSelectedAttributes(
+        boruta_final,
+        withTentative = FALSE
+      )
+
+    },
+
+    warning = function(w) {
+
+      iteration_warnings <<- c(
+        iteration_warnings,
+        conditionMessage(w)
+      )
+
+      invokeRestart(
+        "muffleWarning"
+      )
+
+    }
+  )
+
+  selected_i <- boruta_result
+
+  # --------------------------------------------------------
+  # Store results
+  # --------------------------------------------------------
+
+  selected_features_list[[i]] <- selected_i
+
+  n_features_selected[i] <- length(
+    selected_i
+  )
+
+  overlap_i <- intersect(
+    original_features,
+    selected_i
+  )
+
+  n_original_recovered[i] <- length(
+    overlap_i
+  )
+
+  iteration_warning_count[i] <- length(
+    iteration_warnings
+  )
+
+  iteration_warning_messages[[i]] <- iteration_warnings
+
+  # --------------------------------------------------------
+  # Progress
+  # --------------------------------------------------------
+
+  cat(
+    "Features selected:",
+    n_features_selected[i],
+    "\n"
+  )
+
+  cat(
+    "Original 20 recovered:",
+    n_original_recovered[i],
+    "/ 20\n"
+  )
+
+  cat(
+    "Warnings:",
+    iteration_warning_count[i],
+    "\n"
+  )
+
+  # --------------------------------------------------------
+  # Save progress every 25 iterations
+  # --------------------------------------------------------
+
+  if (
+    i %% 25 == 0
+  ) {
+
+    saveRDS(
+      selected_features_list,
+      file.path(
+        stability_dir,
+        "Stratified_Subscale_Selected_Features_Progress.rds"
+      )
+    )
+
+    cat(
+      "Progress saved at iteration:",
+      i,
+      "\n"
+    )
+  }
+}
+
+cat(
+  "\n========================================\n",
+  "Feature-selection stability analysis complete.\n",
+  "Iterations completed:",
+  n_iterations,
+  "\n",
+  "========================================\n"
+)
+```
+
+# 6. Analyze Warnings and Selection Sizes
+
+```{r}
+# ==========================================================
+# STABILITY ANALYSIS DIAGNOSTICS
+# ==========================================================
+
+iteration_summary <- data.frame(
+  Iteration = seq_len(n_iterations),
+  Features_Selected = n_features_selected,
+  Original_20_Recovered = n_original_recovered,
+  Warning_Count = iteration_warning_count
+)
+
+cat(
+  "\nSelection-size summary:\n"
+)
+
+print(
+  summary(
+    n_features_selected
+  )
+)
+
+cat(
+  "\nOriginal-20 recovery summary:\n"
+)
+
+print(
+  summary(
+    n_original_recovered
+  )
+)
+
+cat(
+  "\nTotal warning events:\n"
+)
+
+print(
+  sum(
+    iteration_warning_count
+  )
+)
+
+cat(
+  "\nIterations with at least one warning:\n"
+)
+
+print(
+  sum(
+    iteration_warning_count > 0
+  )
+)
+
+# ==========================================================
+# SAVE ITERATION SUMMARY
+# ==========================================================
+
+iteration_summary_path <- file.path(
+  stability_dir,
+  "Feature_Selection_Stability_Iteration_Summary.csv"
+)
+
+write.csv(
+  iteration_summary,
+  iteration_summary_path,
+  row.names = FALSE
+)
+
+cat(
+  "\nSaved:",
+  iteration_summary_path,
+  "\n"
+)
+
+# ==========================================================
+# SAVE WARNING LOG
+# ==========================================================
+
+warning_log <- data.frame(
+  Iteration = rep(
+    seq_len(n_iterations),
+    times = iteration_warning_count
+  ),
+  Warning = unlist(
+    iteration_warning_messages,
+    use.names = FALSE
+  ),
+  stringsAsFactors = FALSE
+)
+
+warning_log_path <- file.path(
+  stability_dir,
+  "Feature_Selection_Stability_Warning_Log.csv"
+)
+
+write.csv(
+  warning_log,
+  warning_log_path,
+  row.names = FALSE
+)
+
+cat(
+  "Saved:",
+  warning_log_path,
+  "\n"
+)
+```
+
+
+# 7. Calculate Feature Selection Frequencies
+
+
+```{r}
+# ==========================================================
+# FEATURE SELECTION FREQUENCY
+# ==========================================================
+
+all_selected_features <- sort(
+  unique(
+    unlist(
+      selected_features_list,
+      use.names = FALSE
+    )
+  )
+)
+
+selection_counts <- sapply(
+  all_selected_features,
+  function(feature) {
+
+    sum(
+      vapply(
+        selected_features_list,
+        function(selected_features) {
+
+          feature %in% selected_features
+
+        },
+        logical(1)
+      )
+    )
+
+  }
+)
+
+stability_table <- data.frame(
+
+  Feature = names(
+    selection_counts
+  ),
+
+  Times_Selected = as.integer(
+    selection_counts
+  ),
+
+  Selection_Frequency = as.numeric(
+    selection_counts / n_iterations
+  ),
+
+  Selection_Percent = as.numeric(
+    selection_counts / n_iterations * 100
+  ),
+
+  Original_20 = names(
+    selection_counts
+  ) %in% original_features,
+
+  stringsAsFactors = FALSE
+)
+
+stability_table <- stability_table[
+  order(
+    -stability_table$Selection_Percent,
+    stability_table$Feature
+  ),
+  ,
+  drop = FALSE
+]
+
+rownames(
+  stability_table
+) <- NULL
+
+cat(
+  "Total unique features selected across all iterations:",
+  nrow(stability_table),
+  "\n"
+)
+
+print(
+  head(
+    stability_table,
+    30
+  )
+)
+```
+
+# 8. Stability of the Original 20 Features
+
+```{r}
+# ==========================================================
+# ORIGINAL 20 FEATURE STABILITY
+# ==========================================================
+
+original20_stability <- stability_table[
+  stability_table$Original_20,
+  ,
+  drop = FALSE
+]
+
+# Add any original feature that was never selected
+missing_original <- setdiff(
+  original_features,
+  original20_stability$Feature
+)
+
+if (length(missing_original) > 0) {
+
+  missing_rows <- data.frame(
+
+    Feature = missing_original,
+
+    Times_Selected = 0L,
+
+    Selection_Frequency = 0,
+
+    Selection_Percent = 0,
+
+    Original_20 = TRUE,
+
+    stringsAsFactors = FALSE
+
+  )
+
+  original20_stability <- rbind(
+    original20_stability,
+    missing_rows
+  )
+}
+
+# Restore original 20-feature order
+original20_stability <- original20_stability[
+  match(
+    original_features,
+    original20_stability$Feature
+  ),
+  ,
+  drop = FALSE
+]
+
+rownames(
+  original20_stability
+) <- NULL
+
+print(
+  original20_stability[
+    ,
+    c(
+      "Feature",
+      "Times_Selected",
+      "Selection_Percent"
+    )
+  ]
+)
+
+# ----------------------------------------------------------
+# Summary statistics
+# ----------------------------------------------------------
+
+n_ge_80 <- sum(
+  original20_stability$Selection_Percent >= 80
+)
+
+n_ge_90 <- sum(
+  original20_stability$Selection_Percent >= 90
+)
+
+mean_stability <- mean(
+  original20_stability$Selection_Percent
+)
+
+median_stability <- median(
+  original20_stability$Selection_Percent
+)
+
+cat(
+  "\n========================================\n"
+)
+
+cat(
+  "Original features >=80%:",
+  n_ge_80,
+  "/",
+  length(original_features),
+  "\n"
+)
+
+cat(
+  "Original features >=90%:",
+  n_ge_90,
+  "/",
+  length(original_features),
+  "\n"
+)
+
+cat(
+  "Mean selection frequency:",
+  round(
+    mean_stability,
+    1
+  ),
+  "%\n"
+)
+
+cat(
+  "Median selection frequency:",
+  round(
+    median_stability,
+    1
+  ),
+  "%\n"
+)
+
+cat(
+  "========================================\n"
+)
+```
+
+
+# 9. Save Stability Tables
+
+```{r}
+# ==========================================================
+# SAVE FINAL STABILITY TABLES
+# ==========================================================
+
+stability_table_path <- file.path(
+  stability_dir,
+  "Feature_Selection_Stability_All_Features.csv"
+)
+
+original20_path <- file.path(
+  stability_dir,
+  "Original_20_Feature_Stability.csv"
+)
+
+write.csv(
+  stability_table,
+  stability_table_path,
+  row.names = FALSE
+)
+
+write.csv(
+  original20_stability,
+  original20_path,
+  row.names = FALSE
+)
+
+cat(
+  "Saved:",
+  stability_table_path,
+  "\n"
+)
+
+cat(
+  "Saved:",
+  original20_path,
+  "\n"
+)
+```
+
+
+# 10. Stability Plot for the Original 20 Features
+
+```{r}
+# ==========================================================
+# ORIGINAL 20 FEATURE STABILITY PLOT
+# ==========================================================
+
+plot_data <- original20_stability
+
+# Extract species name for readable labels
+plot_data$Species <- sub(
+  ".*\\|s__",
+  "",
+  plot_data$Feature
+)
+
+plot_data$Species <- gsub(
+  "_",
+  " ",
+  plot_data$Species
+)
+
+plot_data$Species <- factor(
+  plot_data$Species,
+  levels = plot_data$Species[
+    order(
+      plot_data$Selection_Percent
+    )
+  ]
+)
+
+stability_fig <- ggplot(
+  plot_data,
+  aes(
+    x = Selection_Percent,
+    y = Species
+  )
+) +
+
+  geom_col(
+    width = 0.70
+  ) +
+
+  geom_vline(
+    xintercept = 80,
+    linetype = "dashed",
+    linewidth = 0.7
+  ) +
+
+  labs(
+    title = "Stability of the 20 Discovery-Selected Microbial Features",
+    subtitle = paste0(
+      n_ge_80,
+      " of 20 features were selected in >=80% of resamples"
+    ),
+    x = "Selection frequency (%)",
+    y = NULL
+  ) +
+
+  coord_cartesian(
+    xlim = c(0, 100)
+  ) +
+
+  theme_minimal(
+    base_size = 12
+  )
+
+print(
+  stability_fig
+)
+
+stability_fig_path <- file.path(
+  figures_dir,
+  "Feature_Selection_Stability_Original_20.png"
+)
+
+ggsave(
+  stability_fig_path,
+  plot = stability_fig,
+  width = 9,
+  height = 7,
+  dpi = 300
+)
+
+cat(
+  "Saved:",
+  stability_fig_path,
+  "\n"
+)
+```
+
+# 11. Final Reproducibility Summary
+
+```{r}
+# ==========================================================
+# FINAL REPRODUCIBILITY CHECK
+# ==========================================================
+
+final_checks <- c(
+
+  "Shared 92-sample training set" =
+    nrow(X_train_raw) == 92,
+
+  "Exactly 20 original features" =
+    length(original_features) == 20,
+
+  "200 stability iterations completed" =
+    length(selected_features_list) == 200,
+
+  "Original 20 stability table created" =
+    nrow(original20_stability) == 20,
+
+  "All-feature stability table saved" =
+    file.exists(stability_table_path),
+
+  "Original-20 stability table saved" =
+    file.exists(original20_path),
+
+  "Iteration summary saved" =
+    file.exists(iteration_summary_path),
+
+  "Warning log saved" =
+    file.exists(warning_log_path),
+
+  "Stability figure saved" =
+    file.exists(stability_fig_path)
+
+)
+
+print(
+  final_checks
+)
+
+cat(
+  "\nAll checks passed:",
+  all(final_checks),
+  "\n"
+)
+```
+
+
+```{r}
+# ==========================================================
+# ORIGINAL 20 FEATURE STABILITY PLOT
+# ==========================================================
+
+plot_data <- original20_stability
+
+plot_data$Species <- sub(
+  ".*\\|s__",
+  "",
+  plot_data$Feature
+)
+
+plot_data$Species <- gsub(
+  "_",
+  " ",
+  plot_data$Species
+)
+
+plot_data$Species <- factor(
+  plot_data$Species,
+  levels = plot_data$Species[
+    order(plot_data$Selection_Percent)
+  ]
+)
+
+stability_fig <- ggplot(
+  plot_data,
+  aes(
+    x = Selection_Percent,
+    y = Species
+  )
+) +
+  geom_col(width = 0.70) +
+  geom_vline(
+    xintercept = 80,
+    linetype = "dashed",
+    linewidth = 0.7
+  ) +
+  labs(
+    title = "Stability of the 20 Discovery-Selected Microbial Features",
+    subtitle = paste0(
+      n_ge_80,
+      " of 20 features selected in >=80% of resamples"
+    ),
+    x = "Selection frequency (%)",
+    y = NULL
+  ) +
+  coord_cartesian(xlim = c(0, 100)) +
+  theme_minimal(base_size = 12)
+
+print(stability_fig)
+
+stability_fig_path <- file.path(
+  figures_dir,
+  "Feature_Selection_Stability_Original_20.png"
+)
+
+ggsave(
+  stability_fig_path,
+  plot = stability_fig,
+  width = 9,
+  height = 7,
+  dpi = 300
+)
+
+cat("Saved:", stability_fig_path, "\n")
+```
+
+## Session information
+
+The final section records the exact R session used for this knit. The same information is also saved as a text artifact so the HTML report and repository contain both a human-readable and machine-readable provenance record.
+
+```{r session-information}
+session_file <- file.path(
+  results_dir,
+  "session_info",
+  "09_Feature_Selection_Stability_sessionInfo.txt"
+)
+write_session_info(session_file)
+cat("Saved session information to:", session_file, "\n\n")
+sessionInfo()
+```

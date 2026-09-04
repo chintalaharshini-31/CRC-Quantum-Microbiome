@@ -1,0 +1,2 @@
+Model,Accuracy,Precision,Recall_Sensitivity,Specificity,F1_Score,ROC_AUC,MCC
+"QSVC (8 qubits, top-8 features)",0.5454545454545454,0.5,0.6,0.5,0.5454545454545454,0.6083333333333334,0.1

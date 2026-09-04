@@ -1,0 +1,27 @@
+External Validation Reproducibility Checklist -- FengQ_2015
+External dataset loaded : PASS
+Both classes present : PASS
+Expected feature count (20) per model : PASS
+Feature alignment complete (no missing model features) : PASS
+Frozen scalers loaded (not refit) : PASS
+Frozen LR model loaded : PASS
+Frozen RF model loaded : PASS
+Frozen SVM model loaded : PASS
+Frozen XGBoost model loaded : PASS
+No model retraining performed : PASS
+AUC files saved (all 4 models) : PASS
+Confusion matrix heatmaps saved (all 4 models) : PASS
+ROC figure saved : PASS
+AUC comparison figure saved : PASS
+Sensitivity comparison figure saved : PASS
+Cohort metadata saved : PASS
+Feature alignment audit saved : PASS
+Predictions saved (all 4 models) : PASS
+Metrics saved (all 4 models) : PASS
+Confusion matrices saved (all 4 models) : PASS
+ROC coordinates saved (all 4 models) : PASS
+Calibration metrics saved : PASS
+Calibration decile data saved : PASS
+Calibration figure saved : PASS
+Calibration results contain all four models : PASS
+Master comparison saved : PASS

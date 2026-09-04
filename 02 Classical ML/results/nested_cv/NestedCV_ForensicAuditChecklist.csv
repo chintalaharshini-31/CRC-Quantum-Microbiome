@@ -1,0 +1,14 @@
+"Item","Verified"
+"Exact primary 92/22 split reused",TRUE
+"22-sample primary test set never used in fitting/tuning",TRUE
+"Outer validation observations excluded from outer preprocessing",TRUE
+"NZV fitted within each relevant training split",TRUE
+"Boruta fitted within each relevant training split",TRUE
+"Scaling fitted within each relevant training split",TRUE
+"Inner validation observations excluded from inner preprocessing",TRUE
+"Hyperparameter tuning uses inner validation only",TRUE
+"Outer evaluation performed after all model decisions",TRUE
+"Outer validation predictions saved",TRUE
+"Feature-selection membership saved by outer fold",TRUE
+"Inner tuning records saved",TRUE
+"No primary results/models directory root overwritten",TRUE

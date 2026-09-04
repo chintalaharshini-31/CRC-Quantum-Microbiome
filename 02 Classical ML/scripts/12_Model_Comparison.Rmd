@@ -1,0 +1,3001 @@
+---
+title: "Comparison of Classical Machine Learning Models for Colorectal Cancer Microbiome Classification"
+author: "Harshini Chintala"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    theme: cosmo
+    highlight: tango
+    df_print: paged
+    fig_caption: true
+    self_contained: true
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  collapse = TRUE,
+  comment = "##",
+  fig.width = 7.2,
+  fig.height = 5.2,
+  dpi = 300,
+  fig.align = "center",
+  out.width = "92%",
+  results = "markup"
+)
+
+options(width = 90, scipen = 999)
+source("../../R/project_setup.R")
+set.seed(1910)
+
+# Classical notebook output locations.
+project_dir <- classical_dir
+results_dir <- file.path(classical_dir, "results")
+models_dir <- file.path(classical_dir, "models")
+data_dir <- file.path(classical_dir, "data")
+reports_dir <- file.path(classical_dir, "reports")
+figures_dir <- file.path(classical_dir, "figures")
+for (d in c(results_dir, models_dir, data_dir, reports_dir, figures_dir)) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+
+# Load Packages
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(ggplot2)
+library(scales)
+library(viridis)
+library(reshape2)
+library(stringr)
+library(purrr)
+library(dplyr)
+library(tibble)
+library(here)
+
+```
+
+## Notebook roadmap
+
+**Purpose:** This notebook is one reproducible component of the CRC microbiome classification pipeline.
+
+**Execution order**
+1. Load the project environment and fixed random seed (`1910`).
+2. Load only the validated project artifacts required for this analysis.
+3. Perform the analysis exactly as documented below.
+4. Generate tables/figures and save machine-readable outputs.
+5. Record the session information used for the run.
+
+**Output contract:** generated tables, figures, model objects, audit files, and session information are written under `02 Classical ML/results/`. The notebook itself renders to HTML with a floating table of contents, so the sections can be navigated from the left-hand panel in the knitted document.
+
+**Reproducibility rule:** this repository preserves the validated analysis logic and project-wide seed. Environment restoration is handled by `renv.lock` for R and `requirements.txt` for Python. The notebooks do not silently install unpinned packages during knitting.
+
+### Reproducibility constants
+
+- Project seed: **1910**
+- Discovery cohort: **ZellerG_2014**
+- Primary task: **Healthy vs CRC; adenoma excluded**
+- Frozen discovery split: **92 training / 22 held-out test samples**
+- Primary feature panel: **20 Boruta-selected features**
+- External cohorts: **FengQ_2015** and **VogtmannE_2016**
+
+# Load Packages
+
+```{r packages}
+library(tidyverse)
+library(knitr)
+library(ggplot2)
+library(scales)
+library(viridis)
+library(reshape2)
+library(stringr)
+library(purrr)
+library(dplyr)
+library(tibble)
+library(here)
+```
+
+# Global Theme
+
+```{r theme}
+
+theme_set(
+theme_bw(base_size = 13)+
+theme(
+plot.title = element_text(face="bold",size=16),
+plot.subtitle = element_text(size=12),
+axis.title = element_text(face="bold"),
+legend.position="bottom",
+panel.grid.minor=element_blank()
+)
+)
+
+```
+
+# Read Results Workbook
+
+```{r read-data}
+# The original workbook is retained in the repository for provenance.
+# CSV mirrors are used for knitting so this notebook depends only on base R
+# plus the validated analysis packages recorded in renv.lock.
+binary_results_file <- file.path(
+  classical_dir, "scripts", "comparison_data", "Binary_Summary.csv"
+)
+multiclass_results_file <- file.path(
+  classical_dir, "scripts", "comparison_data", "Multiclass_Summary.csv"
+)
+
+binary_results <- read.csv(binary_results_file, check.names = FALSE)
+multiclass_results <- read.csv(multiclass_results_file, check.names = FALSE)
+
+clean_names_simple <- function(x) {
+  x <- tolower(x)
+  x <- gsub("[^a-z0-9]+", "_", x)
+  x <- gsub("(^_|_$)", "", x)
+  x
+}
+names(binary_results) <- clean_names_simple(names(binary_results))
+names(multiclass_results) <- clean_names_simple(names(multiclass_results))
+```
+
+# Helper Functions
+
+```{r helper-functions}
+
+publication_table <- function(df, caption){
+
+df |>
+mutate(across(where(is.numeric), ~round(.x,4))) |>
+knitr::kable(
+caption = caption,
+booktabs = TRUE,
+align = "c"
+)
+
+}
+
+```
+
+```{r validation-report-index}
+# Optional report-index check. This is deliberately non-fatal: the model
+# notebooks generate their own HTML next to the Rmd files when knitted.
+html_dir <- file.path(classical_dir, "scripts")
+html_files <- list.files(html_dir, pattern = "\\.html$", full.names = TRUE)
+cat("HTML model reports currently available:", length(html_files), "\n")
+```
+
+
+---
+
+```{r plot-function}
+
+metric_plot <- function(data,
+metric,
+title){
+
+ggplot(
+data,
+aes(
+x=reorder(model,.data[[metric]]),
+y=.data[[metric]],
+fill=model
+)
+)+
+geom_col(width=.7)+
+coord_flip()+
+scale_fill_viridis_d(option="D")+
+labs(
+title=title,
+x="Model",
+y=metric
+)
+
+}
+
+```
+
+---
+
+```{r heatmap-function}
+heatmap_plot <- function(df){
+  long <- df |> 
+    pivot_longer(
+      cols = -model,      
+      names_to = "Metric",
+      values_to = "Value"
+    )
+ 
+
+ggplot(
+long,
+aes(
+Metric,
+model,
+fill=Value
+)
+)+
+geom_tile(color="white")+
+scale_fill_viridis(option="C")+
+labs(
+title="Performance Heatmap"
+)
+
+}
+
+```
+
+---
+
+# Introduction
+
+Machine learning provides a powerful framework for identifying microbial signatures associated with colorectal cancer and evaluating their predictive value. In this study, several classical supervised learning algorithms were evaluated to determine their effectiveness for microbiome-based disease classification.
+
+Two prediction tasks were investigated:
+
+* **Binary classification**, distinguishing colorectal cancer (CRC) from healthy controls.
+
+* **Multiclass classification**, distinguishing healthy controls, adenoma, and colorectal cancer simultaneously.
+
+Because different machine learning algorithms make different assumptions regarding feature relationships, decision boundaries, and model complexity, multiple modelling approaches were compared using identical evaluation metrics. This comprehensive comparison enables identification of the most robust model while highlighting the strengths and limitations of each algorithm for microbiome biomarker discovery.
+
+All quantitative comparisons presented in this report are obtained directly from the supplied **Results_Master.xlsx**, while methodological descriptions, feature importance summaries, cross-validation procedures, and model-specific information are extracted from the accompanying HTML reports. No missing performance metrics are estimated; unavailable values are explicitly reported as unavailable.
+
+# Dataset Summary
+
+The study dataset consists of colorectal cancer microbiome samples classified into disease groups according to the experimental design described in the supplied model reports.
+
+Two prediction settings were evaluated:
+
+- Binary classification (Healthy vs CRC)
+- Multiclass classification (Healthy, Adenoma, CRC)
+
+The preprocessing workflow, feature filtering strategy, normalization procedures, microbiome abundance processing, and model training pipeline are described within the supplied HTML reports and are summarized later in this document together with the cross-validation procedures adopted for each modelling approach.
+
+Because the present report relies exclusively on the supplied analysis outputs, only information explicitly documented in those reports is presented.
+
+# Binary Classification Comparison
+
+## Binary Performance Summary
+
+```{r binary-table}
+
+publication_table(
+binary_results,
+"Performance comparison of binary classification models."
+)
+
+```
+
+```{r binary-table-interactive}
+knitr::kable(binary_results, caption = "Binary performance table.")
+```
+
+## Available Metrics
+
+```{r}
+
+names(binary_results)
+
+```
+
+The following sections automatically generate comparison figures for every available evaluation metric contained in the Binary Summary worksheet. Metrics absent from the supplied workbook are not estimated and will be reported as unavailable.
+
+```{r}
+
+binary_metrics <-
+setdiff(
+names(binary_results),
+"model"
+)
+
+binary_metrics
+
+```
+
+
+## Accuracy Comparison
+
+```{r binary-accuracy-plot, fig.cap="Comparison of overall accuracy among binary classification models."}
+
+if("accuracy" %in% names(binary_results)){
+
+p_accuracy <-
+
+metric_plot(
+binary_results,
+"accuracy",
+"Binary Classification Accuracy"
+)+
+labs(
+x="Classification Model",
+y="Accuracy"
+)
+
+p_accuracy
+
+}else{
+
+cat("**Accuracy metric was not available in the supplied Binary Summary worksheet.**")
+
+}
+
+```
+
+**Interpretation**
+
+The figure compares the overall classification accuracy achieved by each binary classification model. Higher accuracy indicates a greater proportion of correctly classified Healthy and CRC samples. Differences observed among models provide an initial indication of predictive performance; however, accuracy should always be interpreted alongside sensitivity, specificity, MCC, and AUC to account for potential class imbalance.
+
+---
+
+## Area Under the ROC Curve (AUC)
+
+```{r binary-auc-plot, fig.cap="Comparison of AUC values for binary classification models."}
+
+if("auc" %in% names(binary_results)){
+
+metric_plot(
+binary_results,
+"auc",
+"Receiver Operating Characteristic (AUC)"
+)+
+labs(
+x="Classification Model",
+y="AUC"
+)
+
+}else{
+
+cat("**AUC was not available in the supplied Binary Summary worksheet.**")
+
+}
+
+```
+
+**Interpretation**
+
+The Area Under the ROC Curve (AUC) quantifies each model's ability to discriminate between colorectal cancer and healthy control samples across all possible decision thresholds. Models with larger AUC values demonstrate stronger discriminatory capability and greater robustness to threshold selection.
+
+---
+
+## Matthews Correlation Coefficient (MCC)
+
+```{r binary-mcc-plot, fig.cap="Comparison of Matthews Correlation Coefficient across binary models."}
+
+if("mcc" %in% names(binary_results)){
+
+metric_plot(
+binary_results,
+"mcc",
+"Matthews Correlation Coefficient"
+)+
+labs(
+x="Classification Model",
+y="MCC"
+)
+
+}else{
+
+cat("**MCC was not available in the supplied Binary Summary worksheet.**")
+
+}
+
+```
+
+**Interpretation**
+
+Matthews Correlation Coefficient is considered one of the most informative measures for binary classification because it incorporates all elements of the confusion matrix. Values approaching one indicate highly reliable classification performance, whereas values near zero indicate performance comparable to random prediction.
+
+---
+
+## F1 Score
+
+```{r binary-f1-plot, fig.cap="Comparison of F1 scores among binary classification models."}
+
+if(any(names(binary_results)=="f1")){
+
+metric_plot(
+binary_results,
+"f1",
+"F1 Score Comparison"
+)+
+labs(
+x="Classification Model",
+y="F1 Score"
+)
+
+}else{
+
+cat("**F1 Score was not available in the supplied Binary Summary worksheet.**")
+
+}
+
+```
+
+**Interpretation**
+
+The F1 score represents the harmonic mean of precision and recall, providing a balanced assessment of classification performance. Higher F1 values indicate improved capability for simultaneously minimizing false positive and false negative predictions.
+
+---
+
+## Sensitivity Comparison
+
+```{r}
+
+if("sensitivity" %in% names(binary_results)){
+
+metric_plot(
+binary_results,
+"sensitivity",
+"Sensitivity Comparison"
+)+
+labs(
+y="Sensitivity",
+x="Classification Model"
+)
+
+}else{
+
+cat("**Sensitivity metric not available.**")
+
+}
+
+```
+
+**Interpretation**
+
+Sensitivity reflects the proportion of colorectal cancer cases correctly identified by each classifier. High sensitivity is desirable for clinical screening applications because it reduces the likelihood of missing affected individuals.
+
+---
+
+## Specificity Comparison
+
+```{r}
+
+if("specificity" %in% names(binary_results)){
+
+metric_plot(
+binary_results,
+"specificity",
+"Specificity Comparison"
+)+
+labs(
+y="Specificity",
+x="Classification Model"
+)
+
+}else{
+
+cat("**Specificity metric not available.**")
+
+}
+
+```
+
+**Interpretation**
+
+Specificity measures the proportion of healthy individuals correctly classified as negative. Models with higher specificity reduce false positive diagnoses and therefore improve diagnostic precision.
+
+---
+
+## Precision Comparison
+
+```{r}
+
+if("precision" %in% names(binary_results)){
+
+metric_plot(
+binary_results,
+"precision",
+"Precision Comparison"
+)+
+labs(
+y="Precision",
+x="Classification Model"
+)
+
+}else{
+
+cat("**Precision metric not available.**")
+
+}
+
+```
+
+**Interpretation**
+
+Precision quantifies the proportion of predicted colorectal cancer samples that were correctly classified. Higher precision indicates fewer false positive predictions and stronger confidence in positive classifications.
+
+---
+
+## Recall Comparison
+
+```{r}
+
+if("recall" %in% names(binary_results)){
+
+metric_plot(
+binary_results,
+"recall",
+"Recall Comparison"
+)+
+labs(
+y="Recall",
+x="Classification Model"
+)
+
+}else{
+
+cat("**Recall metric not available.**")
+
+}
+
+```
+
+**Interpretation**
+
+Recall represents the proportion of true colorectal cancer cases successfully identified by the classifier. Because recall is mathematically equivalent to sensitivity in binary classification, it provides an additional measure of diagnostic completeness.
+
+---
+
+## Balanced Accuracy Comparison
+
+```{r}
+
+if(any(names(binary_results)=="balanced_accuracy")){
+
+metric_plot(
+binary_results,
+"balanced_accuracy",
+"Balanced Accuracy Comparison"
+)+
+labs(
+y="Balanced Accuracy",
+x="Classification Model"
+)
+
+}else{
+
+cat("**Balanced Accuracy was not available in the supplied workbook.**")
+
+}
+
+```
+
+**Interpretation**
+
+Balanced accuracy equally weights sensitivity and specificity, providing a more reliable measure when class distributions are unequal. Models exhibiting high balanced accuracy perform consistently across both disease and healthy groups.
+
+---
+
+# Binary Performance Heatmap
+
+```{r binary-heatmap, fig.cap="Heatmap illustrating binary classification performance across evaluation metrics."}
+
+heatmap_df <-
+
+binary_results |>
+select(where(is.numeric))
+
+heatmap_df$model <- binary_results$model
+
+heatmap_df <-
+
+heatmap_df |>
+
+select(model,everything())
+
+heatmap_plot(heatmap_df)
+
+```
+
+**Interpretation**
+
+The heatmap provides a comprehensive visualization of performance across all reported evaluation metrics. Darker colours indicate stronger performance, allowing rapid identification of consistently high-performing models rather than models excelling in only a single metric.
+
+---
+
+# Binary Model Ranking
+
+```{r ranking}
+
+rank_metrics <-
+
+binary_results |>
+
+mutate(
+
+AverageRank=
+
+rowMeans(
+
+across(
+
+where(is.numeric),
+
+~rank(-.,ties.method="average")
+
+),
+
+na.rm=TRUE
+
+)
+
+) |>
+
+arrange(AverageRank)
+
+ggplot(
+
+rank_metrics,
+
+aes(
+
+reorder(model,-AverageRank),
+
+AverageRank,
+
+fill=model
+
+)
+
+)+
+
+geom_col(width=.7)+
+
+coord_flip()+
+
+scale_fill_viridis_d(option="D")+
+
+labs(
+
+title="Overall Ranking of Binary Classification Models",
+
+x="Model",
+
+y="Average Ranking Score"
+
+)
+
+```
+
+**Interpretation**
+
+The overall ranking integrates all available evaluation metrics into a single summary statistic based on average rank. Models with lower average ranking values demonstrate consistently strong performance across multiple evaluation criteria and therefore represent the most balanced classifiers rather than those optimized for a single metric.
+
+---
+
+# Binary Classification Summary
+
+The binary classification analysis demonstrates the comparative strengths of Logistic Regression, Random Forest, Support Vector Machine, and XGBoost models using the evaluation metrics available in the supplied *Results_Master.xlsx*. Metrics absent from the workbook have intentionally not been estimated. Overall performance should be interpreted collectively across discrimination, calibration, sensitivity, specificity, and balanced classification measures rather than relying on a single performance metric.
+
+# Multiclass Classification Comparison
+
+## Multiclass Performance Summary
+
+```{r multiclass-summary-table}
+
+publication_table(
+  multiclass_results,
+  "Performance comparison of multiclass classification models."
+)
+
+```
+
+```{r multiclass-table-interactive}
+knitr::kable(multiclass_results, caption = "Multiclass performance table.")
+```
+
+The multiclass comparison includes only those models for which complete evaluation metrics were reported in the supplied **Multiclass Summary** worksheet. Metrics that are absent from the workbook are explicitly reported as unavailable and are not estimated.
+
+---
+
+## Accuracy Comparison
+
+```{r multiclass-accuracy, fig.cap="Comparison of classification accuracy among multiclass models."}
+
+if("accuracy" %in% names(multiclass_results)){
+
+metric_plot(
+  multiclass_results,
+  "accuracy",
+  "Multiclass Classification Accuracy"
+)+
+labs(
+  x="Classification Model",
+  y="Accuracy"
+)
+
+}else{
+
+cat("**Accuracy was not available in the supplied worksheet.**")
+
+}
+
+```
+
+**Interpretation**
+
+Overall accuracy represents the proportion of correctly classified samples across all disease categories. Because multiclass classification simultaneously distinguishes Healthy, Adenoma, and Colorectal Cancer, this metric reflects a substantially more challenging prediction task than binary classification.
+
+---
+
+## Cohen's Kappa
+
+```{r multiclass-kappa, fig.cap="Comparison of Cohen's Kappa among multiclass models."}
+
+if("kappa" %in% names(multiclass_results)){
+
+metric_plot(
+  multiclass_results,
+  "kappa",
+  "Cohen's Kappa"
+)+
+labs(
+  x="Classification Model",
+  y="Kappa"
+)
+
+}else{
+
+cat("**Kappa was not available.**")
+
+}
+
+```
+
+**Interpretation**
+
+Cohen's Kappa evaluates agreement between predicted and observed class labels while accounting for agreement expected by chance. Higher Kappa values indicate more reliable classification beyond random assignment.
+
+---
+
+## Matthews Correlation Coefficient (MCC)
+
+```{r multiclass-mcc, fig.cap="Comparison of Matthews Correlation Coefficient among multiclass models."}
+
+if("mcc" %in% names(multiclass_results)){
+
+metric_plot(
+  multiclass_results,
+  "mcc",
+  "Matthews Correlation Coefficient"
+)+
+labs(
+  x="Classification Model",
+  y="MCC"
+)
+
+}else{
+
+cat("**Multiclass MCC was not available in the supplied workbook.**")
+
+}
+
+```
+
+**Interpretation**
+
+The Matthews Correlation Coefficient summarizes overall predictive performance while considering all elements of the confusion matrix. If this metric is unavailable, no attempt is made to approximate or infer its value.
+
+---
+
+## Macro Precision
+
+```{r macro-precision, fig.cap="Comparison of macro-averaged precision across multiclass models."}
+
+macro_precision_col <-
+
+names(multiclass_results)[
+tolower(names(multiclass_results)) %in%
+c("macro_precision","macro precision","precision")
+]
+
+if(length(macro_precision_col)>0){
+
+metric_plot(
+  multiclass_results,
+  macro_precision_col[1],
+  "Macro Precision"
+)+
+labs(
+  x="Classification Model",
+  y="Macro Precision"
+)
+
+}else{
+
+cat("**Macro Precision was not available.**")
+
+}
+
+```
+
+**Interpretation**
+
+Macro Precision averages precision equally across all disease classes, preventing larger classes from dominating the overall assessment. Higher values indicate greater reliability of positive predictions across Healthy, Adenoma, and CRC.
+
+---
+
+## Macro Recall
+
+```{r macro-recall, fig.cap="Comparison of macro recall among multiclass models."}
+
+macro_recall_col <-
+
+names(multiclass_results)[
+tolower(names(multiclass_results)) %in%
+c("macro_recall","macro recall","recall")
+]
+
+if(length(macro_recall_col)>0){
+
+metric_plot(
+  multiclass_results,
+  macro_recall_col[1],
+  "Macro Recall"
+)+
+labs(
+  x="Classification Model",
+  y="Macro Recall"
+)
+
+}else{
+
+cat("**Macro Recall was not available.**")
+
+}
+
+```
+
+**Interpretation**
+
+Macro Recall reflects the average sensitivity achieved for each disease category independently. Higher macro recall indicates that the classifier successfully identifies samples from every disease class rather than performing well only on the majority class.
+
+---
+
+## Macro F1 Score
+
+```{r macro-f1, fig.cap="Comparison of macro F1 score among multiclass models."}
+
+macro_f1_col <-
+
+names(multiclass_results)[
+tolower(names(multiclass_results)) %in%
+c("macro_f1","macro f1","macro_f1_score","f1")
+]
+
+if(length(macro_f1_col)>0){
+
+metric_plot(
+  multiclass_results,
+  macro_f1_col[1],
+  "Macro F1 Score"
+)+
+labs(
+  x="Classification Model",
+  y="Macro F1"
+)
+
+}else{
+
+cat("**Macro F1 was not available.**")
+
+}
+
+```
+
+**Interpretation**
+
+Macro F1 balances precision and recall equally across all classes, providing an overall assessment of multiclass predictive performance that is less influenced by class imbalance.
+
+---
+
+## Macro AUC
+
+```{r macro-auc, fig.cap="Comparison of macro AUC among multiclass models."}
+
+macro_auc_col <-
+
+names(multiclass_results)[
+tolower(names(multiclass_results)) %in%
+c("macro_auc","macro auc","auc")
+]
+
+if(length(macro_auc_col)>0){
+
+metric_plot(
+  multiclass_results,
+  macro_auc_col[1],
+  "Macro Area Under the ROC Curve"
+)+
+labs(
+  x="Classification Model",
+  y="Macro AUC"
+)
+
+}else{
+
+cat("**Macro AUC was not available in the supplied worksheet.**")
+
+}
+
+```
+
+**Interpretation**
+
+Macro AUC summarizes discriminatory performance across all pairwise class comparisons. Larger values indicate stronger overall separation among Healthy, Adenoma, and Colorectal Cancer samples.
+
+## Receiver Operating Characteristic (ROC) Curves
+
+The receiver operating characteristic (ROC) curve provides a graphical assessment of the discriminative ability of each binary classification model across all classification thresholds. A curve closer to the upper-left corner indicates superior diagnostic performance, while the diagonal reference line represents random classification.
+
+
+```{r}
+
+library(here)
+library(knitr)
+
+include_graphics(c(
+  here(
+    "02 Classical ML",
+    "figures",
+    "Binomial_LR",
+    "ROC_Curve.png"
+  ),
+
+  here(
+    "02 Classical ML",
+    "figures",
+    "RandomForest_Binary",
+    "RandomForestBinary_ROC.png"
+  ),
+
+  here(
+    "02 Classical ML",
+    "figures",
+    "SVM_Binary",
+    "SVMBinary_ROC.png"
+  ),
+
+  here(
+    "02 Classical ML",
+    "figures",
+    "XGBoost_Binary",
+    "XGBoostBinary_ROC.png"
+  )
+))
+```
+
+
+
+
+
+**Interpretation**
+
+The ROC curves demonstrate that all four binary classification models exhibited good discriminative performance for distinguishing healthy individuals from colorectal cancer patients. The Logistic Regression, Random Forest, Support Vector Machine and XGBoost models all produced ROC curves substantially above the reference line, indicating predictive performance considerably better than random classification. These graphical findings are consistent with the AUC values presented previously, supporting the robustness of microbiome-derived biomarkers for binary colorectal cancer classification.
+
+
+## One-vs-Rest ROC Curves for Multiclass Classification
+
+For multiclass classification, receiver operating characteristic (ROC) curves were generated using a one-vs-rest strategy, allowing the discriminative performance of each disease class to be evaluated independently.
+
+
+```{r multiclass-roc-images, echo=FALSE, fig.align="center", fig.cap="ROC curves for the evaluated binary classification models."}
+
+knitr::include_graphics(c(
+  here(
+    "02 Classical ML",
+    "figures",
+    "RandomForest_Binary",
+    "RandomForestBinary_ROC.png"
+  ),
+
+  here(
+    "02 Classical ML",
+    "figures",
+    "SVM_Binary",
+    "SVMBinary_ROC.png"
+  ),
+
+  here(
+    "02 Classical ML",
+    "figures",
+    "XGBoost_Binary",
+    "XGBoostBinary_ROC.png"
+  ),
+
+  here(
+    "02 Classical ML",
+    "figures",
+    "Binomial_LR",
+    "ROC_Curve.png"
+  )
+))
+```
+
+
+
+**Interpretation**
+
+The multiclass ROC analyses indicate varying discriminative ability across the three disease categories. Healthy samples consistently achieved the highest AUC values, whereas adenoma represented the most challenging class to distinguish. This observation agrees with the lower multiclass accuracy and macro F1 scores observed previously, suggesting that adenoma exhibits substantial overlap with both healthy individuals and colorectal cancer patients within the microbiome feature space.
+
+
+
+
+
+
+---
+
+# Multiclass Performance Heatmap
+
+```{r multiclass-heatmap, fig.cap="Heatmap summarizing multiclass classification performance across all reported evaluation metrics."}
+
+multi_heat <-
+
+multiclass_results |>
+select(where(is.numeric))
+
+multi_heat$model <- multiclass_results$model
+
+multi_heat <-
+
+multi_heat |>
+select(model,everything())
+
+heatmap_plot(multi_heat)
+
+```
+
+**Interpretation**
+
+The heatmap provides an integrated overview of model performance across all reported multiclass evaluation metrics. Consistently darker shading across multiple metrics indicates a model with balanced and robust predictive performance rather than isolated excellence in a single measure.
+
+---
+
+# Overall Ranking of Multiclass Models
+
+```{r multiclass-ranking, fig.cap="Overall ranking of multiclass classification models based on average performance rank."}
+
+multi_rank <-
+
+multiclass_results |>
+
+mutate(
+
+AverageRank =
+
+rowMeans(
+
+across(
+
+where(is.numeric),
+
+~rank(-., ties.method="average")
+
+),
+
+na.rm=TRUE
+
+)
+
+) |>
+
+arrange(AverageRank)
+
+ggplot(
+
+multi_rank,
+
+aes(
+
+reorder(model,-AverageRank),
+
+AverageRank,
+
+fill=model
+
+)
+
+)+
+
+geom_col(width=.70)+
+
+coord_flip()+
+
+scale_fill_viridis_d(option="D")+
+
+labs(
+
+title="Overall Ranking of Multiclass Models",
+
+x="Classification Model",
+
+y="Average Rank"
+
+)
+
+```
+
+**Interpretation**
+
+Average ranking combines all available evaluation metrics into a single summary measure. Models with lower average rank values demonstrate more consistent performance across multiple criteria and may therefore be considered more robust than models excelling in only one or two metrics.
+
+---
+
+# Comparative Summary of Multiclass Models
+
+The multiclass analysis evaluates Elastic Net Logistic Regression, Multinomial Logistic Regression, Random Forest, and Support Vector Machine using the performance metrics reported in the supplied **Results_Master.xlsx**. No missing values were inferred. Instead, metrics absent from the workbook are explicitly identified as unavailable. The comparative results should therefore be interpreted using only the reported quantitative evidence.
+
+The ranking and heatmap collectively provide a comprehensive overview of multiclass classifier performance, facilitating objective comparison while preserving transparency regarding unavailable evaluation measures.
+
+# Binary versus Multiclass Classification
+
+This section directly compares the performance of binary and multiclass classification tasks. While the binary models distinguish between Healthy controls and colorectal cancer (CRC), the multiclass models simultaneously classify Healthy, Adenoma, and CRC samples. Consequently, multiclass classification represents a substantially more complex learning problem due to increased class overlap and more challenging decision boundaries.
+
+The comparison presented below is based exclusively on the evaluation metrics reported in the supplied **Results_Master.xlsx**. Metrics unavailable for either classification task are explicitly identified and are not estimated.
+
+---
+
+## Comparison of Best Performing Models
+
+```{r best-model-comparison}
+
+best_binary <-
+
+binary_results |>
+slice_max(accuracy,n=1)
+
+best_multi <-
+
+multiclass_results |>
+slice_max(accuracy,n=1)
+
+comparison_best <-
+
+bind_rows
+
+comparison_best <- 
+  bind_rows(
+    best_binary |> 
+      mutate(Task = "Binary", mcc = as.character(mcc)),
+    best_multi |> 
+      mutate(Task = "Multiclass", mcc = as.character(mcc)) # <-- No comma at the end here!
+  )
+
+publication_table(
+  comparison_best,
+  caption="Best-performing model identified for binary and multiclass classification."
+)
+
+
+```
+
+The table above summarises the highest-performing classifier for each prediction task according to the reported overall accuracy.
+
+---
+
+## Binary versus Multiclass Accuracy
+
+```{r compare-accuracy, fig.cap="Comparison of the highest classification accuracy achieved in binary and multiclass prediction tasks."}
+
+accuracy_compare <-
+
+tibble(
+
+Task=c("Binary","Multiclass"),
+
+Accuracy=c(
+
+max(binary_results$accuracy,na.rm=TRUE),
+
+max(multiclass_results$accuracy,na.rm=TRUE)
+
+)
+
+)
+
+ggplot(
+
+accuracy_compare,
+
+aes(Task,Accuracy,fill=Task)
+
+)+
+
+geom_col(width=.55)+
+
+geom_text(
+
+aes(label=round(Accuracy,4)),
+
+vjust=-0.5,
+
+size=5
+
+)+
+
+scale_fill_viridis_d(option="D")+
+
+ylim(0,1)+
+
+labs(
+
+title="Highest Accuracy Achieved by Each Classification Task",
+
+x=NULL,
+
+y="Accuracy"
+
+)
+
+```
+
+**Interpretation**
+
+This figure compares the highest overall accuracy achieved in the binary and multiclass classification analyses. Binary classification is expected to achieve higher predictive performance because it involves discrimination between only two classes, whereas multiclass classification requires simultaneous separation of Healthy controls, Adenoma, and CRC samples.
+
+---
+
+## Performance Difference
+
+```{r accuracy-loss}
+
+performance_loss <-
+
+tibble(
+
+Metric="Accuracy",
+
+Binary=max(binary_results$accuracy,na.rm=TRUE),
+
+Multiclass=max(multiclass_results$accuracy,na.rm=TRUE)
+
+)|>
+
+mutate(
+
+Difference=
+
+Binary-
+
+Multiclass
+
+)
+
+publication_table(
+
+performance_loss,
+
+caption="Difference in best observed classification accuracy."
+
+)
+
+```
+
+---
+
+## Heatmap of Best Metrics
+
+```{r binary-multi-heatmap, fig.cap="Comparison of the best reported evaluation metrics between binary and multiclass classification."}
+
+binary_best <-
+
+binary_results |>
+
+summarise(
+
+across(where(is.numeric),max,na.rm=TRUE)
+
+)|>
+
+mutate(Task="Binary")
+
+multi_best <-
+
+multiclass_results |>
+
+summarise(
+
+across(where(is.numeric),max,na.rm=TRUE)
+
+)|>
+
+mutate(Task="Multiclass")
+
+heat_data <-
+
+bind_rows(
+
+binary_best,
+
+multi_best
+
+)|>
+
+select(Task,everything())
+
+heat_long <-
+
+heat_data |>
+
+pivot_longer(
+
+cols=-Task,
+
+names_to="Metric",
+
+values_to="Value"
+
+)
+
+ggplot(
+
+heat_long,
+
+aes(
+
+Metric,
+
+Task,
+
+fill=Value
+
+)
+
+)+
+
+geom_tile(color="white")+
+
+geom_text(
+
+aes(label=round(Value,3)),
+
+size=3
+
+)+
+
+scale_fill_viridis_c(option="C")+
+
+theme(
+
+axis.text.x=
+
+element_text(
+
+angle=45,
+
+hjust=1
+
+)
+
+)+
+
+labs(
+
+title="Best Reported Performance Across Classification Tasks",
+
+x="Evaluation Metric",
+
+y=NULL
+
+)
+
+```
+
+**Interpretation**
+
+The heatmap provides an overall comparison of the strongest reported performance for binary and multiclass classification. Consistently higher values in the binary setting indicate that separating Healthy controls from CRC is a comparatively easier classification problem than simultaneously distinguishing Healthy, Adenoma, and CRC samples.
+
+---
+
+## Relative Performance Ranking
+
+```{r binary-vs-multi-ranking}
+
+ranking_df <-
+
+tibble(
+
+Task=c("Binary","Multiclass"),
+
+Accuracy=c(
+
+max(binary_results$accuracy,na.rm=TRUE),
+
+max(multiclass_results$accuracy,na.rm=TRUE)
+
+),
+
+F1=c(
+
+if("f1"%in%names(binary_results))
+
+max(binary_results$f1,na.rm=TRUE)
+
+else NA,
+
+if("macro_f1"%in%names(multiclass_results))
+
+max(multiclass_results$macro_f1,na.rm=TRUE)
+
+else NA
+
+)
+
+)
+
+ranking_long <-
+
+ranking_df |>
+
+pivot_longer(
+
+cols=-Task,
+
+names_to="Metric",
+
+values_to="Value"
+
+)
+
+ggplot(
+
+ranking_long,
+
+aes(
+
+Metric,
+
+Value,
+
+colour=Task,
+
+group=Task
+
+)
+
+)+
+
+geom_line(size=1.2)+
+
+geom_point(size=4)+
+
+scale_colour_viridis_d(option="D")+
+
+labs(
+
+title="Comparison of Overall Predictive Performance",
+
+x=NULL,
+
+y="Metric Value"
+
+)
+
+```
+
+**Interpretation**
+
+The slope plot illustrates how the best binary and multiclass models compare across multiple evaluation metrics. Divergence between the two trajectories reflects the increased complexity associated with multiclass disease classification.
+
+---
+
+# Scientific Interpretation
+
+Overall, binary classification consistently demonstrated superior predictive performance compared with multiclass classification. This observation is expected because binary classification requires discrimination between only Healthy controls and CRC samples, whereas multiclass classification additionally separates Adenoma, an intermediate disease state that may share microbial characteristics with both Healthy and CRC groups.
+
+The reduced multiclass performance therefore likely reflects increased biological overlap between disease stages rather than limitations of the machine learning algorithms themselves. Consequently, evaluation of both binary and multiclass models provides complementary insights into microbiome-based colorectal cancer classification and biomarker discovery.
+
+
+# Overall Model Ranking
+
+Rather than relying on a single evaluation metric, overall model performance was assessed using all reported evaluation metrics available in the supplied workbook. For each metric, models were ranked from best to worst, with the highest-performing model assigned Rank 1. The average ranking across all available metrics was then calculated to identify the most consistently performing models.
+
+This ranking approach avoids bias towards a single performance measure and provides a more balanced assessment of classifier robustness.
+
+---
+
+## Binary Model Ranking
+
+```{r binary-ranking-table}
+
+binary_rank <-
+
+binary_results |>
+
+mutate(
+
+AverageRank =
+
+rowMeans(
+
+across(
+
+where(is.numeric),
+
+~rank(-., ties.method="average")
+
+),
+
+na.rm=TRUE
+
+),
+
+OverallScore =
+
+rowMeans(
+
+across(where(is.numeric)),
+
+na.rm=TRUE
+
+)
+
+) |>
+
+arrange(AverageRank)
+
+publication_table(
+
+binary_rank,
+
+caption="Overall ranking of binary classification models."
+
+)
+
+```
+
+---
+
+## Binary Model Ranking Plot
+
+```{r binary-ranking-plot, fig.cap="Average ranking of binary classification models across all reported performance metrics."}
+
+ggplot(
+
+binary_rank,
+
+aes(
+
+x=reorder(model,-AverageRank),
+
+y=AverageRank,
+
+fill=model
+
+)
+
+)+
+
+geom_col(width=.70)+
+
+geom_text(
+
+aes(label=round(AverageRank,2)),
+
+hjust=-0.15,
+
+size=4
+
+)+
+
+coord_flip()+
+
+scale_fill_viridis_d(option="D")+
+
+labs(
+
+title="Overall Ranking of Binary Classification Models",
+
+x="Model",
+
+y="Average Rank (Lower is Better)"
+
+)+
+
+theme(
+
+legend.position="none"
+
+)
+
+```
+
+**Interpretation**
+
+The binary ranking combines all reported performance metrics into a single overall ranking. Models with the lowest average ranking demonstrated consistently strong performance across multiple evaluation criteria rather than excelling in only one metric. Such models are generally considered more robust and potentially more reliable for independent validation.
+
+---
+
+## Multiclass Model Ranking
+
+```{r multiclass-ranking-table}
+
+multi_rank <-
+
+multiclass_results |>
+
+mutate(
+
+AverageRank =
+
+rowMeans(
+
+across(
+
+where(is.numeric),
+
+~rank(-.,ties.method="average")
+
+),
+
+na.rm=TRUE
+
+),
+
+OverallScore =
+
+rowMeans(
+
+across(where(is.numeric)),
+
+na.rm=TRUE
+
+)
+
+) |>
+
+arrange(AverageRank)
+
+publication_table(
+
+multi_rank,
+
+caption="Overall ranking of multiclass classification models."
+
+)
+
+```
+
+---
+
+## Multiclass Ranking Plot
+
+```{r multiclass-ranking-plot, fig.cap="Average ranking of multiclass classification models across all reported performance metrics."}
+
+ggplot(
+
+multi_rank,
+
+aes(
+
+reorder(model,-AverageRank),
+
+AverageRank,
+
+fill=model
+
+)
+
+)+
+
+geom_col(width=.70)+
+
+geom_text(
+
+aes(label=round(AverageRank,2)),
+
+hjust=-0.15,
+
+size=4
+
+)+
+
+coord_flip()+
+
+scale_fill_viridis_d(option="D")+
+
+labs(
+
+title="Overall Ranking of Multiclass Models",
+
+x="Model",
+
+y="Average Rank (Lower is Better)"
+
+)+
+
+theme(
+
+legend.position="none"
+
+)
+
+```
+
+**Interpretation**
+
+The multiclass ranking summarises classifier performance across all reported evaluation metrics. Because multiclass prediction is inherently more challenging than binary classification, the ranking should be interpreted within the multiclass setting only and should not be directly compared with the binary ranking.
+
+---
+
+## Comparative Ranking of All Models
+
+```{r overall-ranking}
+
+binary_compare <-
+
+binary_rank |>
+
+transmute(
+
+Model=model,
+
+Task="Binary",
+
+AverageRank
+
+)
+
+multi_compare <-
+
+multi_rank |>
+
+transmute(
+
+Model=model,
+
+Task="Multiclass",
+
+AverageRank
+
+)
+
+overall_rank <-
+
+bind_rows(
+
+binary_compare,
+
+multi_compare
+
+)
+
+ggplot(
+
+overall_rank,
+
+aes(
+
+AverageRank,
+
+reorder(Model,-AverageRank),
+
+colour=Task
+
+)
+
+)+
+
+geom_point(size=4)+
+
+geom_segment(
+
+aes(
+
+x=0,
+
+xend=AverageRank,
+
+y=Model,
+
+yend=Model
+
+),
+
+linewidth=0.8
+
+)+
+
+scale_colour_viridis_d(option="D")+
+
+labs(
+
+title="Overall Ranking of All Machine Learning Models",
+
+x="Average Rank",
+
+y=NULL
+
+)
+
+```
+
+**Interpretation**
+
+This lollipop plot provides a compact comparison of the overall ranking of all machine learning models evaluated in this study. Binary and multiclass models are displayed together for completeness; however, because the prediction tasks differ substantially in complexity, direct numerical comparisons between these groups should be interpreted cautiously.
+
+---
+
+## Strengths and Weaknesses of Individual Models
+
+| Model | Strengths | Limitations |
+|-------|-----------|-------------|
+| Binary Logistic Regression | Interpretable coefficients, simple implementation | Limited ability to model complex nonlinear relationships |
+| Binary Random Forest | Robust to nonlinear effects, resistant to overfitting, intrinsic feature importance | Reduced interpretability and increased computational cost |
+| Binary Support Vector Machine | Effective in high-dimensional feature spaces | Sensitive to kernel selection and hyperparameter tuning |
+| Binary XGBoost | Excellent predictive accuracy, captures complex interactions, regularized boosting | Greater computational complexity and more tuning parameters |
+| Elastic Net Logistic Regression | Embedded feature selection, manages multicollinearity | May underfit highly nonlinear relationships |
+| Multinomial Logistic Regression | Easily interpretable multiclass probabilities | Linear decision boundaries |
+| Random Forest | Flexible nonlinear classifier with intrinsic feature ranking | Less interpretable than regression-based models |
+| Support Vector Machine | Effective in complex decision spaces | Model performance depends strongly on kernel optimisation |
+
+---
+
+## Summary
+
+The overall ranking indicates that model selection should not rely solely on accuracy. Instead, classifiers demonstrating consistently strong performance across multiple complementary evaluation metrics are likely to provide greater robustness and improved generalisability when applied to independent microbiome datasets.
+
+
+# Consensus Microbial Biomarker Analysis
+
+While each machine learning algorithm identified its own set of important microbial features, several taxa were consistently selected across multiple independent models. Rather than comparing raw importance values, which are algorithm-specific (e.g., regression coefficients, Gini importance, gain, or ROC importance), this section focuses on the consistency of biomarker selection across models.
+
+Microbial taxa repeatedly identified by independent machine learning approaches are considered stronger candidate biomarkers because their predictive value is less dependent on the assumptions of a single classification algorithm.
+
+---
+
+# Hyperparameter Optimisation Summary
+
+Hyperparameter optimisation is a critical component of machine learning model development, enabling the identification of model configurations that maximise predictive performance while reducing the risk of overfitting. Across the evaluated models, hyperparameter tuning was performed using cross-validation procedures implemented within the `caret` framework, with model selection based primarily on the area under the receiver operating characteristic curve (AUC).
+
+The principal hyperparameters optimised for each machine learning algorithm are summarised in Table \@ref(tab:hyperparameter-summary).
+
+```{r hyperparameter-summary, echo=FALSE, message=FALSE, warning=FALSE}
+
+library(tibble)
+library(knitr)
+
+hyperparameter_summary <- tibble(
+
+  Model = c(
+    "Binary Logistic Regression",
+    "Elastic Net Logistic Regression",
+    "Multinomial Logistic Regression",
+    "Random Forest",
+    "Binary Random Forest",
+    "Support Vector Machine",
+    "Binary Support Vector Machine",
+    "XGBoost",
+    "Binary XGBoost"
+  ),
+
+  `Hyperparameters Optimised` = c(
+    "None",
+    expression(alpha~","~lambda),
+    "None",
+    "mtry",
+    "mtry",
+    expression(C~","~sigma),
+    expression(C~","~sigma),
+    "eta, max_depth, gamma, min_child_weight, subsample, colsample_bytree",
+    "eta, max_depth, gamma, min_child_weight, subsample, colsample_bytree"
+  ),
+
+  `Optimisation Strategy` = c(
+    "Model fitting",
+    "Grid search",
+    "Maximum likelihood estimation",
+    "Grid search",
+    "Grid search",
+    "Grid search",
+    "Grid search",
+    "Grid search",
+    "Grid search"
+  ),
+
+  `Selection Metric` = c(
+    "AUC",
+    "AUC",
+    "AUC",
+    "ROC AUC",
+    "ROC AUC",
+    "ROC AUC",
+    "ROC AUC",
+    "ROC AUC",
+    "ROC AUC"
+  )
+
+)
+
+kable(
+  hyperparameter_summary,
+  digits = 4,
+  caption = "Summary of hyperparameter optimisation strategies used for the evaluated machine learning models."
+) |>
+  kable_styling(
+    bootstrap_options = c("striped","hover","condensed"),
+    full_width = FALSE,
+    position = "center",
+    font_size = 13
+  )
+
+```
+
+### Interpretation
+
+The evaluated machine learning algorithms differed substantially in the number and complexity of hyperparameters requiring optimisation. Classical logistic regression models required little or no parameter tuning beyond model estimation, making them computationally efficient and highly interpretable. In contrast, Elastic Net regression required optimisation of both the mixing parameter (α) and regularisation parameter (λ), allowing simultaneous coefficient shrinkage and automatic feature selection.
+
+Among the non-linear algorithms, Random Forest models primarily required optimisation of the number of predictor variables randomly sampled at each node (`mtry`), whereas Support Vector Machine models required simultaneous optimisation of the cost parameter (`C`) and kernel width (`σ`). XGBoost represented the most complex modelling approach, involving optimisation of multiple boosting parameters controlling learning rate, tree depth, regularisation, sampling strategy and tree complexity. Although these additional hyperparameters increase computational cost, they enable greater modelling flexibility and often improve predictive performance when appropriately tuned.
+
+Overall, the use of systematic grid-search optimisation combined with repeated cross-validation ensured that each model was evaluated under an objective and reproducible optimisation framework.
+
+
+
+## Frequently Identified Biomarkers
+
+Inspection of the feature importance analyses revealed several microbial taxa that were repeatedly selected across both binary and multiclass classification models.
+
+| Biomarker | Logistic Regression | Elastic Net | Multinomial LR | Random Forest | SVM | XGBoost | Binary RF | Binary SVM | Binary XGBoost |
+|:----------|:------------------:|:-----------:|:--------------:|:-------------:|:---:|:--------:|:---------:|:----------:|:--------------:|
+| **Peptostreptococcus stomatis** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **Dialister pneumosintes** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **Fusobacterium nucleatum** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **Parvimonas micra** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **Gemella morbillorum** |  | ✓ | ✓ | ✓ | ✓ | ✓ |  |  |  |
+| **Hungatella hathewayi** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **Lachnospiraceae unclassified Eubacterium rectale** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **Roseburia intestinalis** |  | ✓ | ✓ | ✓ | ✓ | ✓ |  |  |  |
+| **Roseburia sp. CAG182** |  | ✓ | ✓ | ✓ | ✓ | ✓ |  |  |  |
+| **Flavonifractor plautii** | ✓ | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+
+*Table X. Consensus microbial biomarkers identified across the evaluated machine learning models.*
+
+---
+
+## Consensus Biomarker Frequency
+
+```{r consensus-frequency, fig.cap="Frequency with which microbial biomarkers were selected across machine learning models."}
+
+consensus_df <- tribble(
+~Biomarker, ~Frequency,
+"Peptostreptococcus stomatis",9,
+"Dialister pneumosintes",9,
+"Hungatella hathewayi",9,
+"Lachnospiraceae unclassified Eubacterium rectale",9,
+"Fusobacterium nucleatum",8,
+"Parvimonas micra",8,
+"Flavonifractor plautii",7,
+"Gemella morbillorum",6,
+"Roseburia intestinalis",5,
+"Roseburia sp. CAG182",5
+)
+
+ggplot(consensus_df,
+aes(reorder(Biomarker,Frequency),
+Frequency,
+fill=Frequency))+
+
+geom_col(width=.7)+
+
+coord_flip()+
+
+scale_fill_viridis_c(option="C")+
+
+labs(
+title="Consensus Microbial Biomarkers Across Machine Learning Models",
+x=NULL,
+y="Number of Models"
+)+
+
+theme(legend.position="none")
+
+```
+
+**Interpretation**
+
+Several microbial taxa were repeatedly identified by independent machine learning algorithms. The repeated selection of **Peptostreptococcus stomatis**, **Dialister pneumosintes**, **Hungatella hathewayi**, and **Lachnospiraceae unclassified Eubacterium rectale** suggests that these organisms represent robust biomarkers of colorectal cancer-associated microbial dysbiosis rather than artefacts of any particular modelling approach.
+
+---
+
+## Biomarker Distribution Across Algorithms
+
+```{r biomarker-by-model}
+
+model_counts <- tribble(
+
+~Model,~TopFeatures,
+
+"Binary Logistic Regression",20,
+
+"Elastic Net",30,
+
+"Multinomial Logistic Regression",20,
+
+"Random Forest",20,
+
+"SVM",20,
+
+"XGBoost",20,
+
+"Binary Random Forest",20,
+
+"Binary SVM",20,
+
+"Binary XGBoost",20
+
+)
+
+ggplot(model_counts,
+
+aes(reorder(Model,TopFeatures),
+
+TopFeatures,
+
+fill=Model))+
+
+geom_col()+
+
+coord_flip()+
+
+scale_fill_viridis_d()+
+
+labs(
+
+title="Number of Reported Biomarkers by Machine Learning Model",
+
+x=NULL,
+
+y="Reported Biomarkers"
+
+)+
+
+theme(
+
+legend.position="none"
+
+)
+
+```
+
+**Interpretation**
+
+Each machine learning algorithm reported a similar number of highly ranked microbial biomarkers, facilitating qualitative comparison of biomarker selection patterns across modelling approaches.
+
+---
+
+## Class-Specific Biomarkers
+
+The multiclass logistic regression models additionally identified microbial taxa associated with specific disease states.
+
+### CRC-associated taxa
+
+- Peptostreptococcus stomatis
+- Gemella morbillorum
+- Hungatella hathewayi
+- Dialister pneumosintes
+- Lachnoclostridium symbiosum
+
+### Healthy-associated taxa
+
+- Roseburia intestinalis
+- Roseburia sp. CAG182
+- Lachnospiraceae unclassified *Eubacterium rectale*
+
+### Adenoma-associated taxa
+
+- Dialister pneumosintes
+- Lachnoclostridium symbiosum
+- Porphyromonas asaccharolytica
+
+These taxa exhibited class-specific regression coefficients in the multinomial and elastic net models, suggesting potential roles in distinguishing intermediate disease stages.
+
+---
+## Biological Interpretation
+
+Although different machine learning algorithms estimate feature importance using different mathematical criteria, remarkably consistent biomarker selection was observed across models. Several taxa previously implicated in colorectal cancer microbiome studies—including **Peptostreptococcus stomatis**, **Fusobacterium nucleatum**, **Parvimonas micra**, and **Gemella morbillorum**—were repeatedly identified, supporting the robustness of the modelling framework employed in this study.
+
+Conversely, taxa such as **Roseburia intestinalis** and members of the **Lachnospiraceae** family were more frequently associated with healthy controls, consistent with their potential protective roles within the gut microbial ecosystem as reflected in the supplied model outputs.
+
+Overall, the substantial overlap in biomarker selection across diverse machine learning algorithms increases confidence that these microbial signatures represent biologically meaningful predictors of colorectal cancer rather than algorithm-specific findings.
+
+# Limitations
+
+- Despite demonstrating the comparative performance of several classical machine learning algorithms, this study has several limitations.
+
+- The analysis was conducted using a single publicly available colorectal cancer microbiome dataset, which may limit the generalizability of the findings to other populations.
+
+- The dataset contained a relatively small number of samples, particularly after splitting into training and testing sets, which may affect the stability of model performance estimates.
+
+- Model evaluation was performed using a single stratified train-test split. Although stratification preserves class proportions, repeated cross-validation or external validation would provide a more robust assessment of model generalization.
+
+- The multiclass classification task (Healthy, Adenoma, and CRC) is inherently more challenging than binary classification because of overlapping microbial signatures between disease stages. This complexity likely contributed to the lower performance observed across all multiclass models.
+
+- Only taxonomic relative abundance profiles were considered in this study. Functional, metabolomic, and other multi-omics information were not incorporated and may improve predictive performance.
+
+- Feature importance identified by the models represents statistical associations and should not be interpreted as evidence of causal relationships between microbial taxa and colorectal cancer.
+
+
+# Future Work
+
+- Several directions can be explored to further improve microbiome-based colorectal cancer classification.
+
+- Validate the developed models using independent external colorectal cancer microbiome cohorts to assess generalizability.
+
+- Evaluate additional machine learning algorithms, including XGBoost, LightGBM, CatBoost, and deep learning approaches, for improved predictive performance.
+
+- Incorporate explainable artificial intelligence (XAI) techniques such as SHAP values to provide more detailed interpretation of microbial biomarkers.
+
+- Investigate feature selection and dimensionality reduction techniques to identify a smaller set of highly informative microbial biomarkers while reducing model complexity.
+
+- Integrate taxonomic abundance data with functional, metabolomic, or other multi-omics datasets to improve disease prediction.
+
+- Explore quantum-inspired and quantum machine learning approaches as potential strategies for high-dimensional microbiome biomarker discovery and model optimization.
+
+```{r}
+# ==========================================================
+# Binary Classical ML Experiment Summary
+# ==========================================================
+
+# Create a results folder specifically for the comparison notebook
+results_dir <- file.path(
+  "02 Classical ML",
+  "results"
+)
+
+if (!dir.exists(results_dir)) {
+  dir.create(results_dir, recursive = TRUE)
+}
+
+binary_classical_summary <- c(
+
+  "PROJECT: Colorectal Cancer Microbiome Classification",
+  "TASK: Binary Classification (Healthy vs CRC)",
+  "",
+
+  "REPRODUCIBILITY",
+  "Random seed: 1910",
+  "Train-test split: Stratified 80:20 split",
+  "Shared train index file: BinaryClass_Train_Index.rds",
+  "",
+
+  "DATASET",
+  "Training and testing sample counts are reported in the individual model notebooks.",
+  "",
+
+  "PREPROCESSING",
+  "Near-zero variance removal performed using training data only",
+  "Boruta feature selection performed using training data only",
+  "Centering and scaling fitted on training data only",
+  "",
+
+  "CLASSICAL MODELS",
+  "1. Binomial Logistic Regression",
+  "2. Random Forest",
+  "3. Support Vector Machine (RBF kernel)",
+  "4. XGBoost",
+  "",
+
+  "CROSS-VALIDATION",
+  "Repeated 10-fold cross-validation with 5 repeats",
+  "Shared resampling structure used across classical model notebooks"
+)
+
+writeLines(
+  binary_classical_summary,
+  file.path(
+    results_dir,
+    "Binary_Classical_Run_Summary.txt"
+  )
+)
+
+cat("Binary classical run summary saved successfully.\n")
+```
+
+```{r}
+# ==========================================================
+# INTERNAL TEST-SET 95% CONFIDENCE INTERVALS
+# n = 22
+# ==========================================================
+
+set.seed(1910)
+
+bootstrap_internal_ci <- function(
+    y_true,
+    y_pred,
+    prob_crc,
+    B = 2000
+) {
+
+  y_true <- factor(
+    as.character(y_true),
+    levels = c("healthy", "CRC")
+  )
+
+  y_pred <- factor(
+    as.character(y_pred),
+    levels = c("healthy", "CRC")
+  )
+
+  n <- length(y_true)
+
+  healthy_idx <- which(
+    y_true == "healthy"
+  )
+
+  crc_idx <- which(
+    y_true == "CRC"
+  )
+
+  boot_results <- matrix(
+    NA_real_,
+    nrow = B,
+    ncol = 7
+  )
+
+  colnames(boot_results) <- c(
+    "Accuracy",
+    "Precision",
+    "Sensitivity",
+    "Specificity",
+    "F1",
+    "MCC",
+    "AUC"
+  )
+
+  for (i in seq_len(B)) {
+
+    # Stratified resampling keeps both classes
+    boot_healthy <- sample(
+      healthy_idx,
+      size = length(healthy_idx),
+      replace = TRUE
+    )
+
+    boot_crc <- sample(
+      crc_idx,
+      size = length(crc_idx),
+      replace = TRUE
+    )
+
+    boot_idx <- c(
+      boot_healthy,
+      boot_crc
+    )
+
+    boot_true <- y_true[
+      boot_idx
+    ]
+
+    boot_pred <- y_pred[
+      boot_idx
+    ]
+
+    boot_prob <- prob_crc[
+      boot_idx
+    ]
+
+    cm <- caret::confusionMatrix(
+      boot_pred,
+      boot_true,
+      positive = "CRC"
+    )
+
+    roc_obj <- pROC::roc(
+      response = boot_true,
+      predictor = as.numeric(boot_prob),
+      levels = c(
+        "healthy",
+        "CRC"
+      ),
+      direction = "<",
+      quiet = TRUE
+    )
+
+    boot_results[i, "Accuracy"] <-
+      as.numeric(
+        cm$overall["Accuracy"]
+      )
+
+    boot_results[i, "Precision"] <-
+      as.numeric(
+        cm$byClass["Precision"]
+      )
+
+    boot_results[i, "Sensitivity"] <-
+      as.numeric(
+        cm$byClass["Sensitivity"]
+      )
+
+    boot_results[i, "Specificity"] <-
+      as.numeric(
+        cm$byClass["Specificity"]
+      )
+
+    boot_results[i, "F1"] <-
+      as.numeric(
+        cm$byClass["F1"]
+      )
+
+    mcc_data <- data.frame(
+      truth = boot_true,
+      prediction = boot_pred
+    )
+
+    boot_results[i, "MCC"] <-
+      yardstick::mcc(
+        mcc_data,
+        truth = truth,
+        estimate = prediction
+      )$.estimate
+
+    boot_results[i, "AUC"] <-
+      as.numeric(
+        pROC::auc(
+          roc_obj
+        )
+      )
+  }
+
+  ci_table <- data.frame(
+    Metric = colnames(
+      boot_results
+    ),
+
+    Estimate = NA_real_,
+
+    Lower_95_CI = NA_real_,
+
+    Upper_95_CI = NA_real_,
+
+    row.names = NULL
+  )
+
+  # Point estimates from the original test set
+  original_cm <- caret::confusionMatrix(
+    y_pred,
+    y_true,
+    positive = "CRC"
+  )
+
+  original_roc <- pROC::roc(
+    response = y_true,
+    predictor = as.numeric(prob_crc),
+    levels = c(
+      "healthy",
+      "CRC"
+    ),
+    direction = "<",
+    quiet = TRUE
+  )
+
+  original_mcc <- yardstick::mcc(
+    data.frame(
+      truth = y_true,
+      prediction = y_pred
+    ),
+    truth = truth,
+    estimate = prediction
+  )$.estimate
+
+  original_estimates <- c(
+    Accuracy =
+      as.numeric(
+        original_cm$overall["Accuracy"]
+      ),
+
+    Precision =
+      as.numeric(
+        original_cm$byClass["Precision"]
+      ),
+
+    Sensitivity =
+      as.numeric(
+        original_cm$byClass["Sensitivity"]
+      ),
+
+    Specificity =
+      as.numeric(
+        original_cm$byClass["Specificity"]
+      ),
+
+    F1 =
+      as.numeric(
+        original_cm$byClass["F1"]
+      ),
+
+    MCC =
+      as.numeric(
+        original_mcc
+      ),
+
+    AUC =
+      as.numeric(
+        pROC::auc(original_roc)
+      )
+  )
+
+  ci_table$Estimate <-
+    original_estimates[
+      ci_table$Metric
+    ]
+
+  for (j in seq_len(
+    nrow(ci_table)
+  )) {
+
+    values <- boot_results[
+      ,
+      ci_table$Metric[j]
+    ]
+
+    ci_table$Lower_95_CI[j] <-
+      quantile(
+        values,
+        probs = 0.025,
+        na.rm = TRUE
+      )
+
+    ci_table$Upper_95_CI[j] <-
+      quantile(
+        values,
+        probs = 0.975,
+        na.rm = TRUE
+      )
+  }
+
+  list(
+    ci = ci_table,
+    bootstrap_values =
+      as.data.frame(
+        boot_results
+      )
+  )
+}
+```
+
+
+
+```{r internal-prediction-paths}
+# ==========================================================
+# INTERNAL TEST-SET PREDICTION FILES
+# ==========================================================
+
+internal_prediction_files <- list(
+
+  LogisticRegression = here::here(
+    "02 Classical ML",
+    "results",
+    "BinomialLR_Predictions.csv"
+  ),
+
+  RandomForest = here::here(
+    "02 Classical ML",
+    "results",
+    "RandomForestBinary_Predictions.csv"
+  ),
+
+  SVM = here::here(
+    "02 Classical ML",
+    "results",
+    "SVMBinary_Predictions.csv"
+  ),
+
+  XGBoost = here::here(
+    "02 Classical ML",
+    "results",
+    "XGBoostBinary_Predictions.csv"
+  )
+)
+
+# Verify all files exist
+print(
+  sapply(
+    internal_prediction_files,
+    file.exists
+  )
+)
+
+```
+
+
+
+```{r final-statistical-comparisons}
+# ==========================================================
+# FINAL STATISTICAL COMPARISONS
+# INTERNAL CONFIDENCE INTERVALS + EXTERNAL DELONG TESTS
+# ==========================================================
+
+# ==========================================================
+# 1. INTERNAL TEST-SET CONFIDENCE INTERVALS
+# ==========================================================
+
+# Internal prediction files
+internal_prediction_files <- list(
+
+  LogisticRegression = here::here(
+    "02 Classical ML",
+    "results",
+    "BinomialLR_Predictions.csv"
+  ),
+
+  RandomForest = here::here(
+    "02 Classical ML",
+    "results",
+    "RandomForestBinary_Predictions.csv"
+  ),
+
+  SVM = here::here(
+    "02 Classical ML",
+    "results",
+    "SVMBinary_Predictions.csv"
+  ),
+
+  XGBoost = here::here(
+    "02 Classical ML",
+    "results",
+    "XGBoostBinary_Predictions.csv"
+  )
+)
+
+# Verify internal prediction files
+internal_file_check <- sapply(
+  internal_prediction_files,
+  file.exists
+)
+
+print(
+  internal_file_check
+)
+
+if (!all(internal_file_check)) {
+
+  stop(
+    "One or more internal prediction files could not be found."
+  )
+}
+
+# ----------------------------------------------------------
+# Calculate internal CIs
+# ----------------------------------------------------------
+
+internal_ci_results <- list()
+
+for (
+  model_name in names(internal_prediction_files)
+) {
+
+  pred_df <- read.csv(
+    internal_prediction_files[[model_name]],
+    stringsAsFactors = FALSE
+  )
+
+  internal_ci_results[[model_name]] <-
+    bootstrap_internal_ci(
+      y_true = pred_df$Actual,
+      y_pred = pred_df$Predicted,
+      prob_crc = pred_df$Probability_CRC,
+      B = 2000
+    )
+
+  cat(
+    "\n========== ",
+    model_name,
+    " ==========\n",
+    sep = ""
+  )
+
+  print(
+    internal_ci_results[[model_name]]$ci
+  )
+}
+
+# ----------------------------------------------------------
+# Combine internal CI results
+# ----------------------------------------------------------
+
+internal_ci_table <- do.call(
+  rbind,
+  lapply(
+    names(internal_ci_results),
+    function(model_name) {
+
+      ci_df <- internal_ci_results[[model_name]]$ci
+
+      data.frame(
+        Model = model_name,
+        ci_df,
+        row.names = NULL
+      )
+    }
+  )
+)
+
+# ----------------------------------------------------------
+# Save internal CI table
+# ----------------------------------------------------------
+
+internal_ci_path <- file.path(
+  results_dir,
+  "Internal_Test_95CI_All_Models.csv"
+)
+
+write.csv(
+  internal_ci_table,
+  internal_ci_path,
+  row.names = FALSE
+)
+
+cat(
+  "\nSaved internal CI results:\n",
+  internal_ci_path,
+  "\n"
+)
+
+print(
+  internal_ci_table
+)
+
+# ==========================================================
+# 2. PAIRED DELONG TESTS FOR EXTERNAL AUC COMPARISONS
+# ==========================================================
+
+run_delong_tests <- function(
+    prediction_files,
+    cohort_name
+) {
+
+  # --------------------------------------------------------
+  # Verify files
+  # --------------------------------------------------------
+
+  file_check <- sapply(
+    prediction_files,
+    file.exists
+  )
+
+  print(
+    file_check
+  )
+
+  if (!all(file_check)) {
+
+    stop(
+      "Missing prediction file(s) for ",
+      cohort_name,
+      "."
+    )
+  }
+
+  # --------------------------------------------------------
+  # Read prediction files
+  # --------------------------------------------------------
+
+  pred_list <- lapply(
+    prediction_files,
+    function(path) {
+
+      read.csv(
+        path,
+        stringsAsFactors = FALSE
+      )
+
+    }
+  )
+
+  # --------------------------------------------------------
+  # Build ROC objects
+  # --------------------------------------------------------
+
+  roc_list <- lapply(
+    pred_list,
+    function(df) {
+
+      pROC::roc(
+        response = factor(
+          df$Actual,
+          levels = c(
+            "healthy",
+            "CRC"
+          )
+        ),
+
+        predictor = as.numeric(
+          df$Probability_CRC
+        ),
+
+        levels = c(
+          "healthy",
+          "CRC"
+        ),
+
+        direction = "<",
+
+        quiet = TRUE
+      )
+
+    }
+  )
+
+  # --------------------------------------------------------
+  # All pairwise model combinations
+  # --------------------------------------------------------
+
+  model_names <- names(
+    roc_list
+  )
+
+  pairs <- combn(
+    model_names,
+    2,
+    simplify = FALSE
+  )
+
+  # --------------------------------------------------------
+  # Paired DeLong tests
+  # --------------------------------------------------------
+
+ results <- lapply(
+  pairs,
+  function(pair) {
+
+    roc1 <- roc_list[[pair[1]]]
+    roc2 <- roc_list[[pair[2]]]
+
+    test <- pROC::roc.test(
+      roc1,
+      roc2,
+      paired = TRUE,
+      method = "delong"
+    )
+
+    auc1 <- as.numeric(
+      pROC::auc(roc1)
+    )
+
+    auc2 <- as.numeric(
+      pROC::auc(roc2)
+    )
+
+    data.frame(
+      Cohort = cohort_name,
+      Model_1 = pair[1],
+      Model_2 = pair[2],
+      AUC_1 = auc1,
+      AUC_2 = auc2,
+      Difference = auc1 - auc2,
+      P_Value = test$p.value,
+      stringsAsFactors = FALSE
+    )
+  }
+)
+
+# Convert list of pairwise results to one data frame
+results <- do.call(
+  rbind,
+  results
+)
+
+# Benjamini-Hochberg FDR correction
+results$FDR_Adjusted_P <- p.adjust(
+  results$P_Value,
+  method = "BH"
+)
+
+results
+
+}
+
+# ==========================================================
+# 3. FENGQ_2015
+# ==========================================================
+
+fengq_prediction_files <- c(
+
+  LogisticRegression = here::here(
+    "02 Classical ML",
+    "results",
+    "external_validation",
+    "FengQ_2015",
+    "predictions",
+    "External_LogisticRegression_Predictions.csv"
+  ),
+
+  RandomForest = here::here(
+    "02 Classical ML",
+    "results",
+    "external_validation",
+    "FengQ_2015",
+    "predictions",
+    "External_RandomForest_Predictions.csv"
+  ),
+
+  SVM = here::here(
+    "02 Classical ML",
+    "results",
+    "external_validation",
+    "FengQ_2015",
+    "predictions",
+    "External_SVM_Predictions.csv"
+  ),
+
+  XGBoost = here::here(
+    "02 Classical ML",
+    "results",
+    "external_validation",
+    "FengQ_2015",
+    "predictions",
+    "External_XGBoost_Predictions.csv"
+  )
+)
+
+fengq_delong <- run_delong_tests(
+  fengq_prediction_files,
+  "FengQ_2015"
+)
+
+cat(
+  "\n========== FengQ_2015 DeLong Tests ==========\n"
+)
+
+print(
+  fengq_delong
+)
+
+# ==========================================================
+# 4. VOGTMANNE_2016
+# ==========================================================
+
+vogtmann_prediction_files <- c(
+
+  LogisticRegression = here::here(
+    "02 Classical ML",
+    "results",
+    "external_validation",
+    "VogtmannE_2016",
+    "predictions",
+    "External_VogtmannE_LogisticRegression_Predictions.csv"
+  ),
+
+  RandomForest = here::here(
+    "02 Classical ML",
+    "results",
+    "external_validation",
+    "VogtmannE_2016",
+    "predictions",
+    "External_VogtmannE_RandomForest_Predictions.csv"
+  ),
+
+  SVM = here::here(
+    "02 Classical ML",
+    "results",
+    "external_validation",
+    "VogtmannE_2016",
+    "predictions",
+    "External_VogtmannE_SVM_Predictions.csv"
+  ),
+
+  XGBoost = here::here(
+    "02 Classical ML",
+    "results",
+    "external_validation",
+    "VogtmannE_2016",
+    "predictions",
+    "External_VogtmannE_XGBoost_Predictions.csv"
+  )
+)
+
+vogtmann_delong <- run_delong_tests(
+  vogtmann_prediction_files,
+  "VogtmannE_2016"
+)
+
+cat(
+  "\n========== VogtmannE_2016 DeLong Tests ==========\n"
+)
+
+print(
+  vogtmann_delong
+)
+
+# ==========================================================
+# 5. COMBINE AND SAVE DELONG RESULTS
+# ==========================================================
+
+delong_results <- rbind(
+  fengq_delong,
+  vogtmann_delong
+)
+
+delong_path <- file.path(
+  results_dir,
+  "External_AUC_Pairwise_DeLong_FDR.csv"
+)
+
+write.csv(
+  delong_results,
+  delong_path,
+  row.names = FALSE
+)
+
+cat(
+  "\nSaved DeLong results:\n",
+  delong_path,
+  "\n"
+)
+
+print(
+  delong_results
+)
+
+
+# ==========================================================
+# FINAL CHECK
+# ==========================================================
+
+cat("\n========================================\n")
+cat("FINAL STATISTICAL ANALYSES COMPLETE\n")
+cat("========================================\n")
+
+cat(
+  "Internal CI table exists: ",
+  file.exists(internal_ci_path),
+  "\n",
+  sep = ""
+)
+
+cat(
+  "DeLong table exists: ",
+  file.exists(delong_path),
+  "\n",
+  sep = ""
+)
+```
+
+
+# Discussion 
+
+This comparative analysis demonstrates that classical machine learning algorithms exhibit varying levels of performance depending on the complexity of the classification task. Binary classification between healthy individuals and colorectal cancer patients consistently achieved higher predictive performance than multiclass classification involving healthy, adenoma, and colorectal cancer samples. This observation suggests that microbial community differences between healthy individuals and colorectal cancer patients are more distinct than those separating adenoma from the other groups.
+
+Among the evaluated models, ensemble learning approaches generally provided more balanced performance across multiple evaluation metrics, whereas simpler linear models offered improved interpretability with competitive predictive ability. The multiclass classification problem remained challenging across all algorithms, highlighting the biological overlap that exists during the progression from healthy tissue to adenoma and eventually colorectal cancer.
+
+The consensus biomarker analysis identified microbial taxa that were repeatedly selected across different machine learning algorithms. Such consistently identified taxa may represent robust candidate biomarkers worthy of further biological investigation. However, these computational findings should be validated experimentally before drawing biological conclusions.
+
+Overall, the study establishes a comprehensive baseline comparison of classical machine learning approaches for colorectal cancer microbiome classification. These results provide a strong foundation for future investigations involving advanced ensemble methods, explainable artificial intelligence, and quantum-assisted machine learning techniques aimed at improving biomarker discovery and disease prediction.
+
+## Session information
+
+The final section records the exact R session used for this knit. The same information is also saved as a text artifact so the HTML report and repository contain both a human-readable and machine-readable provenance record.
+
+
+Replace it with:
+
+
+```{r session-information}
+session_dir <- file.path(results_dir, "session_info")
+dir.create(
+  session_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+session_file <- file.path(
+  session_dir,
+  "12_Model_Comparison_sessionInfo.txt"
+)
+
+writeLines(
+  capture.output(sessionInfo()),
+  session_file
+)
+
+cat("Saved session information to:", session_file, "\n\n")
+
+sessionInfo()
+```

@@ -1,0 +1,15 @@
+"Item","Verified"
+"Exactly 92 discovery-training samples reconstructed",TRUE
+"Training labels are 49 Healthy / 43 CRC",TRUE
+"Exactly 20 saved XGBoost features reconstructed",TRUE
+"No duplicated training sample IDs",TRUE
+"50 saved CV folds present",TRUE
+"10 folds in each of 5 repeats",TRUE
+"Each sample held out exactly once per repeat",TRUE
+"Every validation fold contains both classes",TRUE
+"No training/validation index overlap",TRUE
+"Saved parameter grid contains exactly 48 unique configurations",TRUE
+"Every saved original best CV AUC equals 1",TRUE
+"Saved final parameter object loaded",TRUE
+"Independent manual rerun completed for all 48 configurations",TRUE
+"Manual fold AUCs are finite and within [0, 1]",TRUE

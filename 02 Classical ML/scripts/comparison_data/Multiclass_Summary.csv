@@ -1,0 +1,7 @@
+Model,Accuracy,Kappa,MCC,Macro Precision,Macro Recall,Macro F1,Macro AUC
+Elastic Net LR,0.4333,0.1115,0.125,0.373,0.3944,0.3485,0.6023
+Multinomial LR,0.4667,0.1367,NA,0.333,0.4,,0.6397
+Multiclass RF,0.4667,0.16737,0.1767,0.4309,0.41944,0.396,0.608
+Multiclass SVM,0.4,0.0625,0.0659,0.333,0.3583,0.33,0.6164
+Multiclass XGBoost,0.4,0.0592,0.0665,Evaluation metrics not generated.,,,
+,,,,,,,

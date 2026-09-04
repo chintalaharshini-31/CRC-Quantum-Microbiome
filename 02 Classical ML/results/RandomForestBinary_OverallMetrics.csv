@@ -1,0 +1,7 @@
+"Metric","Value"
+"Accuracy",0.818181818181818
+"Kappa",0.633333333333334
+"AccuracyLower",0.597154216922129
+"AccuracyUpper",0.948132700687563
+"AccuracyPValue",0.00743562327649019
+"McNemarPValue",1

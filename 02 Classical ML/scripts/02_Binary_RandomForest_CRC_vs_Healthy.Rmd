@@ -1,0 +1,1240 @@
+---
+title: "Random Forest Classification for Colorectal Cancer vs Healthy Microbiome Classification (Binary Exploratory Analysis)"
+author: "Harshini Chintala"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    theme: cosmo
+    highlight: tango
+    df_print: paged
+    fig_caption: true
+    self_contained: true
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  collapse = TRUE,
+  comment = "##",
+  fig.width = 7.2,
+  fig.height = 5.2,
+  dpi = 300,
+  fig.align = "center",
+  out.width = "92%",
+  results = "markup"
+)
+
+options(width = 90, scipen = 999)
+source("../../R/project_setup.R")
+set.seed(1910)
+
+# Classical notebook output locations.
+project_dir <- classical_dir
+results_dir <- file.path(classical_dir, "results")
+models_dir <- file.path(classical_dir, "models")
+data_dir <- file.path(classical_dir, "data")
+reports_dir <- file.path(classical_dir, "reports")
+figures_dir <- file.path(classical_dir, "figures")
+for (d in c(results_dir, models_dir, data_dir, reports_dir, figures_dir)) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+
+```
+
+## Notebook roadmap
+
+**Purpose:** This notebook is one reproducible component of the CRC microbiome classification pipeline.
+
+**Execution order**
+1. Load the project environment and fixed random seed (`1910`).
+2. Load only the validated project artifacts required for this analysis.
+3. Perform the analysis exactly as documented below.
+4. Generate tables/figures and save machine-readable outputs.
+5. Record the session information used for the run.
+
+**Output contract:** generated tables, figures, model objects, audit files, and session information are written under `02 Classical ML/results/`. The notebook itself renders to HTML with a floating table of contents, so the sections can be navigated from the left-hand panel in the knitted document.
+
+**Reproducibility rule:** this repository preserves the validated analysis logic and project-wide seed. Environment restoration is handled by `renv.lock` for R and `requirements.txt` for Python. The notebooks do not silently install unpinned packages during knitting.
+
+### Reproducibility constants
+
+- Project seed: **1910**
+- Discovery cohort: **ZellerG_2014**
+- Primary task: **Healthy vs CRC; adenoma excluded**
+- Frozen discovery split: **92 training / 22 held-out test samples**
+- Primary feature panel: **20 Boruta-selected features**
+- External cohorts: **FengQ_2015** and **VogtmannE_2016**
+
+# Introduction
+
+Random Forest is a supervised ensemble learning algorithm that builds a large collection of decorrelated decision trees and aggregates their predictions through majority voting. Each tree is trained on a bootstrap resample of the training data, and at every split only a random subset of predictors (`mtry`) is considered, which decorrelates the trees and reduces the variance of the ensemble relative to a single decision tree.
+
+**Biological objective:** This notebook is a secondary, exploratory analysis of the same Zeller et al. (2014) gut microbiome dataset used throughout this project. Rather than the full three-class problem (Healthy, Adenoma, CRC) evaluated in the main Random Forest notebook, Adenoma samples are excluded entirely and the model is restricted to a simpler, sharper biological question: does the gut microbial abundance profile distinguish colorectal cancer (CRC) patients from healthy controls?
+
+**Machine learning objective:** Train and validate a binary Random Forest classifier using the same preprocessing pipeline, cross-validation philosophy, and reporting structure as the finalized Binomial Logistic Regression notebook and the multiclass Random Forest notebook, so that binary Random Forest performance is directly comparable to the binary logistic regression baseline. This notebook is a standalone exploratory supplement and does not replace or modify the existing multiclass Random Forest notebook; all objects, models, and output files use a distinct `_Binary` naming convention to avoid any collision with the three-class analysis.
+
+**Why Random Forest is appropriate for microbiome abundance data:** Microbial abundance data is high-dimensional (hundreds of taxa), sparse (many near-zero features), compositional, and frequently contains non-linear and interaction effects between taxa that a linear model cannot capture. Random Forest handles high-dimensional, collinear, and non-linear feature spaces natively, is robust to outliers and irrelevant predictors, and provides an internal, model-based measure of variable importance that complements the embedded feature selection already performed upstream by Boruta.
+
+This notebook implements a complete binary Random Forest workflow including data preprocessing, Adenoma exclusion, Boruta feature selection, model training with explicit hyperparameter tuning, prediction, performance evaluation, ROC/AUC analysis, and interpretation of microbial biomarkers specific to the Healthy vs CRC comparison.
+
+
+
+
+
+# Import Dataset
+
+```{r}
+# ==========================================================
+# Load Dataset
+# ==========================================================
+
+library(curatedMetagenomicData)
+library(TreeSummarizedExperiment)
+library(dplyr)
+library(caret)
+library(randomForest)
+library(pROC)
+library(ggplot2)
+library(Boruta)
+
+# Download/load Zeller dataset
+zeller <- curatedMetagenomicData(
+  "ZellerG_2014.relative_abundance",
+  dryrun = FALSE
+)[[1]]
+
+# Extract abundance matrix
+abundance <- assay(zeller)
+
+# Transpose:
+# Rows = samples
+# Columns = microbial species
+X <- as.data.frame(t(abundance))
+
+# Disease labels
+y <- colData(zeller)$study_condition
+
+# Combine into one dataframe
+crc_data <- X
+crc_data$disease <- y
+
+# Check dimensions
+dim(crc_data)
+
+# Class distribution
+table(crc_data$disease)
+```
+
+The Zeller et al. (2014) colorectal cancer dataset consists of 652 microbial relative-abundance features measured across 156 stool samples, spanning three disease states: healthy controls, adenoma, and colorectal cancer.
+
+# Create Binary Dataset
+
+```{r}
+# ==========================================================
+# Create Binary Dataset (Healthy vs CRC only)
+# ==========================================================
+
+binary_data <- crc_data %>%
+  # Rename "control" to "healthy" before filtering
+  mutate(disease = case_match(disease, "control" ~ "healthy", .default = disease)) %>%
+  # Keep only Healthy and CRC — Adenoma is excluded completely
+  filter(disease %in% c("healthy", "CRC"))
+
+# Drop unused factor levels so "adenoma" is removed completely
+binary_data$disease <- factor(binary_data$disease)
+
+# Check dimensions
+dim(binary_data)
+
+# Verify class distribution
+table(binary_data$disease)
+```
+
+Adenoma samples are removed entirely before any preprocessing, scaling, or feature selection takes place, so that no information from the excluded class can leak into the binary pipeline. This mirrors the class handling used in the Binomial Logistic Regression notebook, restricting the problem to a direct Healthy vs CRC comparison and treating this notebook as a self-contained exploratory binary counterpart to the three-class Random Forest analysis.
+
+# Train-Test Split
+
+```{r}
+# ==========================================================
+# Train-Test Split (shared across binary model notebooks)
+# ==========================================================
+
+train_index_path <- file.path(models_dir, "BinaryClass_Train_Index.rds")
+
+if (file.exists(train_index_path)) {
+
+  # Reuse the same split used by any other binary model notebook
+  train_index <- readRDS(train_index_path)
+
+} else {
+
+  # First notebook to run creates and saves the shared binary split
+  set.seed(1910)
+
+  train_index <- createDataPartition(
+    binary_data$disease,
+    p = 0.80,
+    list = FALSE
+  )
+
+  saveRDS(train_index, train_index_path)
+
+}
+
+# Training dataset
+train_data <- binary_data[train_index, ]
+
+# Testing dataset
+test_data <- binary_data[-train_index, ]
+
+# Check dimensions
+dim(train_data)
+dim(test_data)
+
+# Verify class distribution
+prop.table(table(train_data$disease))
+prop.table(table(test_data$disease))
+```
+
+An 80:20 stratified split preserves the relative proportions of Healthy and CRC samples in both the training and testing sets. `train_index` is cached under a dedicated `BinaryClass_Train_Index.rds` file (distinct from the three-class `ThreeClass_Train_Index.rds` used elsewhere in the project) and reused if a prior notebook has already generated the shared binary split, so that any future binary classifier in this project is trained and evaluated on identical data partitions.
+
+# Separate Features and Labels
+
+```{r}
+# ==========================================================
+# Separate Features and Labels
+# ==========================================================
+
+# Training features
+X_train_raw <- train_data %>%
+  select(-disease)
+
+# Testing features
+X_test_raw <- test_data %>%
+  select(-disease)
+
+# Training labels
+y_train <- train_data$disease
+
+# Testing labels
+y_test <- test_data$disease
+
+# Check dimensions
+cat("Training Features:", dim(X_train_raw), "\n")
+cat("Testing Features :", dim(X_test_raw), "\n")
+
+# Check class distribution
+table(y_train)
+table(y_test)
+```
+
+# Near Zero Variance Removal
+
+```{r}
+# ==========================================================
+# Remove Near-Zero Variance Features
+# ==========================================================
+
+# Identify near-zero variance predictors (training data only)
+nzv <- nearZeroVar(X_train_raw)
+
+cat("Number of Near-Zero Variance Features:", length(nzv), "\n")
+
+# Remove them from training and testing data
+if (length(nzv) > 0) {
+
+  X_train_nzv <- X_train_raw[, -nzv]
+  X_test_nzv  <- X_test_raw[, -nzv]
+
+} else {
+
+  X_train_nzv <- X_train_raw
+  X_test_nzv  <- X_test_raw
+
+}
+
+# Check updated dimensions
+cat("Training Features:", dim(X_train_nzv), "\n")
+cat("Testing Features :", dim(X_test_nzv), "\n")
+```
+
+Near-zero variance filtering is computed exclusively on the training data to avoid information leakage from the test set. Microbial abundance data typically contains many taxa that are absent or nearly constant across almost all samples; these features carry little discriminative signal, can destabilize resampling-based model training, and are removed before feature selection. The same columns identified from the training data are then dropped from the test data so that both sets retain an identical feature space.
+
+# Feature Selection using Boruta
+
+```{r}
+# ==========================================================
+# Feature Selection using Boruta (training data only)
+# ==========================================================
+
+set.seed(1910)
+
+boruta_data <- data.frame(
+  Disease = y_train,
+  X_train_nzv,
+  check.names = FALSE
+)
+
+boruta_model <- Boruta(
+  Disease ~ .,
+  data = boruta_data,
+  doTrace = 2
+)
+
+boruta_final <- TentativeRoughFix(boruta_model)
+
+selected_features <- getSelectedAttributes(
+  boruta_final,
+  withTentative = FALSE
+)
+
+cat("Number of selected features:",
+    length(selected_features), "\n")
+
+print(selected_features)
+
+X_train_boruta <- X_train_nzv[, selected_features, drop = FALSE]
+
+X_test_boruta <- X_test_nzv[, selected_features, drop = FALSE]
+```
+
+```{r}
+saveRDS(
+  boruta_model,
+  file.path(
+    models_dir,
+    "Boruta_Model_RandomForest_Binary.rds"
+  )
+)
+
+cat("Boruta model saved successfully.\n")
+```
+
+```{r}
+# ==========================================================
+# Save Selected Features
+# ==========================================================
+
+selected_features_df <- data.frame(
+  Feature = selected_features
+)
+
+write.csv(
+  selected_features_df,
+  file.path(
+    results_dir,
+    "RandomForestBinary_Selected_Features.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("Selected features saved successfully.\n")
+```
+
+Boruta is used here as the dedicated preprocessing feature-selection step, exactly as in the Binomial, Multinomial, Elastic Net, and multiclass Random Forest notebooks. It works by comparing the importance of each real feature against randomized "shadow" copies of that feature across repeated Random Forest runs, retaining only predictors that are confirmed to carry more signal than noise. Because the Healthy vs CRC comparison is a different, simpler classification problem than the three-class task, Boruta is re-run here on the binary training data rather than reusing the three-class selected feature set — the confirmed features may therefore differ from the multiclass notebook. `TentativeRoughFix()` forces a final decision on any features left "Tentative" after the confirmed run, and `getSelectedAttributes()` extracts the confirmed feature set that is carried forward into scaling and model training.
+
+# Feature Scaling
+
+```{r}
+# ==========================================================
+# Feature Scaling
+# ==========================================================
+# Random Forest splits are threshold-based and are therefore
+# insensitive to monotonic feature scaling. This step is
+# retained anyway to keep the preprocessing pipeline identical
+# across every model notebook in the project (Binomial,
+# Multinomial, Elastic Net, and Random Forest), so that any
+# downstream comparison of preprocessing artifacts (e.g. the
+# scaler, the feature name map) is consistent regardless of
+# which model is being evaluated.
+
+# Learn scaling parameters from training data only
+scaler <- preProcess(
+  X_train_boruta,
+  method = c("center", "scale")
+)
+
+# Scale training and testing data
+X_train_scaled <- predict(
+  scaler,
+  X_train_boruta
+)
+
+X_test_scaled <- predict(
+  scaler,
+  X_test_boruta
+)
+
+saveRDS(
+  scaler,
+  file.path(
+    models_dir,
+    "Scaler_RandomForest_Binary.rds"
+  )
+)
+
+cat("Training and testing data scaled successfully.\n")
+```
+
+# Standardize Feature Names
+
+```{r}
+# ==========================================================
+# Standardize Feature Names
+# ==========================================================
+
+feature_name_map <- data.frame(
+  Original = colnames(X_train_scaled),
+  Syntactic = make.names(
+    colnames(X_train_scaled),
+    unique = TRUE
+  ),
+  stringsAsFactors = FALSE
+)
+
+colnames(X_train_scaled) <- feature_name_map$Syntactic
+colnames(X_test_scaled) <- feature_name_map$Syntactic
+
+write.csv(
+  feature_name_map,
+  file.path(
+    results_dir,
+    "RandomForestBinary_FeatureNameMap.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("Feature names standardized successfully.\n")
+```
+
+Full microbial taxonomic strings (e.g. `k__Bacteria|p__Firmicutes|...|s__Faecalibacterium_prausnitzii`) contain characters that are not syntactically valid R column names. `make.names()` converts every feature name into a valid identifier while `feature_name_map` preserves the original taxonomic string so it can be restored for reporting and plotting later in the notebook.
+
+# Create Training and Testing Data Frames
+
+```{r}
+# ==========================================================
+# Create Training and Testing Data Frames
+# ==========================================================
+
+train_df <- data.frame(
+    X_train_scaled,
+    disease = y_train
+)
+
+test_df <- data.frame(
+  X_test_scaled,
+  disease = y_test
+)
+
+str(train_df)
+str(test_df)
+```
+
+# Shared Cross-Validation Folds
+
+```{r}
+# ==========================================================
+# Shared Repeated CV Folds (reused across any future binary
+# model notebooks for a fair, identical resampling comparison)
+# ==========================================================
+
+cv_folds_path <- file.path(models_dir, "BinaryClass_CV_Folds.rds")
+
+if (file.exists(cv_folds_path)) {
+
+  # Reuse the same folds used by any other binary model notebook
+  cv_folds <- readRDS(cv_folds_path)
+
+} else {
+
+  # First notebook to run creates and saves the shared folds
+  set.seed(1910)
+
+  cv_folds <- createMultiFolds(
+    y_train,
+    k = 10,
+    times = 5
+  )
+
+  saveRDS(cv_folds, cv_folds_path)
+
+}
+```
+
+Repeated 10-fold cross-validation (5 repeats) is used to obtain a stable, low-variance estimate of model performance while limiting overfitting to any single train/validation split, consistent with the resampling strategy used in the multiclass Random Forest notebook. The predefined fold indices are cached under a dedicated `BinaryClass_CV_Folds.rds` file and reused whenever a prior notebook has already generated them, so that every binary classifier trained in this project is evaluated on identical resampling partitions.
+
+# Train Random Forest Model
+
+```{r}
+# ==========================================================
+# Train Binary Random Forest Model (caret)
+# ==========================================================
+
+train_control <- trainControl(
+  method = "repeatedcv",
+  number = 10,
+  repeats = 5,
+  classProbs = TRUE,
+  savePredictions = "final",
+  summaryFunction = twoClassSummary,
+  index = cv_folds
+)
+
+# Explicit mtry tuning grid, spanning from a small subset of
+# predictors per split up to roughly all selected features
+n_features <- ncol(X_train_scaled)
+
+mtry_values <- unique(
+  pmax(
+    1,
+    round(
+      seq(
+        from = 2,
+        to = n_features,
+        length.out = min(10, n_features)
+      )
+    )
+  )
+)
+
+tune_grid <- expand.grid(mtry = mtry_values)
+
+tune_grid
+
+set.seed(1910)
+
+rf_binary_model <- caret::train(
+  disease ~ .,
+  data = train_df,
+  method = "rf",
+  trControl = train_control,
+  metric = "ROC",
+  tuneGrid = tune_grid,
+  ntree = 1000,
+  importance = TRUE
+)
+
+cat("Binary Random Forest model trained successfully using caret::train() with repeated 10-fold CV (5 repeats) on shared binary folds.\n")
+
+rf_binary_model
+```
+
+An explicit `mtry` tuning grid is supplied rather than relying on caret's default of testing only a handful of values, so that the number of predictors considered at each split is deliberately searched across a range from a small subset up to nearly the full selected feature set. `ntree = 1000` is fixed at a value large enough for the out-of-bag error to stabilize, and `importance = TRUE` ensures permutation-based variable importance is computed inside the final forest. `twoClassSummary` and `metric = "ROC"` are used in place of the multiclass notebook's `multiClassSummary`/`Accuracy` combination, consistent with the binary evaluation convention already established in the Binomial Logistic Regression notebook. The best model is selected using cross-validated ROC AUC rather than raw Accuracy, which is more robust to any residual class imbalance between Healthy and CRC.
+
+# Model Summary
+
+```{r}
+# ==========================================================
+# Model Summary
+# ==========================================================
+
+rf_binary_model$bestTune
+
+rf_binary_model$finalModel
+
+# Cross-validated resampling summary (mean across folds/repeats)
+rf_binary_model$results
+```
+
+
+```{r}
+# ==========================================================
+# Save Final Hyperparameters
+# ==========================================================
+
+rf_final_hyperparameters <- rf_binary_model$bestTune
+
+write.csv(
+  rf_final_hyperparameters,
+  file.path(
+    results_dir,
+    "RandomForestBinary_Final_Hyperparameters.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("Final Random Forest hyperparameters saved successfully.\n")
+```
+
+
+The best-performing model used `mtry = ` `r rf_binary_model$bestTune$mtry` predictors per split. The final forest summary reports the out-of-bag (OOB) error estimate and the OOB confusion matrix, which give an internal, resampling-free estimate of generalization performance in addition to the repeated cross-validation results above.
+
+# Save Trained Model
+
+```{r}
+# ==========================================================
+# Save Trained Model
+# ==========================================================
+
+saveRDS(
+  rf_binary_model,
+  file = file.path(
+    models_dir,
+    "RandomForestBinary_Model.rds"
+  )
+)
+
+cat("Model saved successfully.\n")
+```
+
+```{r}
+# ==========================================================
+# Save Cross-Validation Results
+# ==========================================================
+
+cv_results   <- rf_binary_model$results
+cv_resamples <- rf_binary_model$resample
+
+write.csv(
+  cv_results,
+  file.path(
+    results_dir,
+    "RandomForestBinary_CV_Results.csv"
+  ),
+  row.names = FALSE
+)
+
+write.csv(
+  cv_resamples,
+  file.path(
+    results_dir,
+    "RandomForestBinary_CV_Resamples.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("Cross-validation results saved successfully.\n")
+```
+
+# Random Forest Feature Importance
+
+```{r}
+## ==========================================================
+# Random Forest Feature Importance
+# ==========================================================
+
+var_importance <- varImp(rf_binary_model)
+
+print(var_importance)
+
+# Convert to data frame
+var_importance_df <- as.data.frame(var_importance$importance)
+var_importance_df$Syntactic <- rownames(var_importance_df)
+
+# Recover original microbiome names
+var_importance_df_named <- var_importance_df %>%
+  left_join(feature_name_map, by = "Syntactic") %>%
+  mutate(
+    Original = if_else(is.na(Original), Syntactic, Original)
+  ) %>%
+  select(Original, Syntactic, everything())
+
+# Calculate overall importance
+importance_score_col <- setdiff(
+  colnames(var_importance_df_named),
+  c("Original", "Syntactic")
+)
+
+var_importance_df_named$MeanImportance <- rowMeans(
+  var_importance_df_named[, importance_score_col, drop = FALSE]
+)
+
+# Rank features
+var_importance_df_named <- var_importance_df_named[
+  order(var_importance_df_named$MeanImportance,
+        decreasing = TRUE),
+]
+
+# Save complete importance table
+write.csv(
+  var_importance_df_named,
+  file.path(
+    results_dir,
+    "RandomForestBinary_VariableImportance.csv"
+  ),
+  row.names = FALSE
+)
+
+# Top 20 important features
+top20_importance <- head(
+  var_importance_df_named,
+  20
+)
+
+print(top20_importance)
+
+cat("Random Forest variable importance saved successfully.\n")
+```
+
+Random Forest variable importance measures how much each feature contributes to reducing classification error across all trees in the forest (via `varImp()`, which uses the mean decrease in accuracy/Gini for classification random forests trained with `importance = TRUE`). Because this is now a two-class problem, the importance score reflects each taxon's contribution to separating Healthy from CRC specifically, rather than being aggregated across three disease states as in the multiclass notebook.
+
+# Feature Importance Plot
+
+```{r}
+# ==========================================================
+# Feature Importance Plot
+# ==========================================================
+
+png(
+  file.path(
+    figures_dir,
+    "RandomForestBinary_VariableImportance_Default.png"
+  ),
+  width = 900,
+  height = 700,
+  res = 150
+)
+
+
+plot(var_importance, top = 20)
+
+dev.off()
+
+importance_plot_df <- top20_importance
+
+importance_plot <- ggplot(
+  importance_plot_df,
+  aes(
+    x = reorder(Original, MeanImportance),
+    y = MeanImportance
+  )
+) +
+  geom_col(width = 0.7, fill = "steelblue") +
+  coord_flip() +
+ labs(
+  title = "Top 20 Features by Random Forest Importance (Binary: Healthy vs CRC)",
+  x = "Microbial Species",
+  y = "Mean Importance"
+)
+
+print(importance_plot)
+
+ggsave(
+  filename = file.path(
+    figures_dir,
+    "RandomForestBinary_VariableImportance.png"
+  ),
+  plot = importance_plot,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+cat("Feature importance plot saved successfully.\n")
+```
+
+The top-ranked features represent the microbial taxa the binary Random Forest relied on most heavily when separating Healthy from CRC samples. These are candidate microbiome biomarkers specific to the Healthy vs CRC comparison and are examined further, with cleaned taxonomic names, in the Top Important Biomarkers section at the end of this notebook.
+
+# Generate Predictions
+
+```{r}
+# ==========================================================
+# Generate Predictions
+# ==========================================================
+
+# Predict disease classes
+rf_binary_predictions <- predict(
+  rf_binary_model,
+  newdata = test_df,
+  type = "raw"
+)
+
+# Predict class probabilities
+rf_binary_probabilities <- predict(
+  rf_binary_model,
+  newdata = test_df,
+  type = "prob"
+)
+
+# Preview predictions
+head(rf_binary_predictions)
+
+head(rf_binary_probabilities)
+```
+
+```{r}
+# ==========================================================
+# Save Predictions
+# ==========================================================
+
+prediction_results <- data.frame(
+  SampleID = rownames(test_data),
+  Actual = y_test,
+  Predicted = rf_binary_predictions,
+  Probability_CRC = rf_binary_probabilities$CRC,
+  Probability_Healthy = rf_binary_probabilities$healthy,
+  row.names = NULL
+)
+
+write.csv(
+  prediction_results,
+  file.path(
+    results_dir,
+    "RandomForestBinary_Predictions.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("Predictions saved successfully.\n")
+```
+
+# Confusion Matrix
+
+```{r}
+# ==========================================================
+# Confusion Matrix
+# ==========================================================
+
+conf_matrix <- confusionMatrix(
+  rf_binary_predictions,
+  y_test,
+  positive = "CRC"
+)
+
+conf_matrix
+```
+
+```{r}
+# ==========================================================
+# Save Confusion Matrix
+# ==========================================================
+
+capture.output(
+  conf_matrix,
+  file = file.path(
+    results_dir,
+    "RandomForestBinary_ConfusionMatrix.txt"
+  )
+)
+
+cat("Confusion matrix saved successfully.\n")
+```
+
+The confusion matrix reports agreement between the binary Random Forest's predicted disease labels and the true labels on the held-out 20% test set, along with overall Accuracy, Kappa, and Sensitivity/Specificity computed by `caret::confusionMatrix()`, with CRC set as the positive class, consistent with the Binomial Logistic Regression notebook.
+
+# Confusion Matrix Heatmap
+
+```{r}
+# ==========================================================
+# Confusion Matrix Heatmap
+# ==========================================================
+
+# Convert confusion matrix to dataframe
+conf_df <- as.data.frame(conf_matrix$table)
+
+# Plot
+confusion_plot <- ggplot(conf_df,
+                         aes(x = Prediction,
+                             y = Reference,
+                             fill = Freq)) +
+
+  geom_tile(color = "white") +
+
+  geom_text(aes(label = Freq),
+            size = 5,
+            fontface = "bold") +
+
+  scale_fill_gradient(
+    low = "white",
+    high = "steelblue"
+  ) +
+
+  labs(
+    title = "Confusion Matrix - Binary Random Forest (Healthy vs CRC)",
+    x = "Predicted Class",
+    y = "Actual Class",
+    fill = "Count"
+  ) +
+
+  theme_minimal(base_size = 14)
+
+confusion_plot
+```
+
+```{r}
+# ==========================================================
+# Save Confusion Matrix Plot
+# ==========================================================
+
+ggsave(
+  filename = file.path(
+    figures_dir,
+    "RandomForestBinary_ConfusionMatrix.png"
+  ),
+  plot = confusion_plot,
+  width = 7,
+  height = 6,
+  dpi = 300
+)
+
+cat("Confusion matrix plot saved successfully.\n")
+```
+
+# Overall Evaluation Metrics
+
+```{r}
+# ==========================================================
+# Overall Evaluation Metrics
+# ==========================================================
+
+evaluation_metrics <- data.frame(
+  Metric = c(
+    "Accuracy",
+    "Kappa",
+    "AccuracyLower",
+    "AccuracyUpper",
+    "AccuracyPValue",
+    "McNemarPValue"
+  ),
+  Value = c(
+    conf_matrix$overall["Accuracy"],
+    conf_matrix$overall["Kappa"],
+    conf_matrix$overall["AccuracyLower"],
+    conf_matrix$overall["AccuracyUpper"],
+    conf_matrix$overall["AccuracyPValue"],
+    conf_matrix$overall["McnemarPValue"]
+  )
+)
+
+evaluation_metrics
+
+write.csv(
+  evaluation_metrics,
+  file.path(
+    results_dir,
+    "RandomForestBinary_OverallMetrics.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("Evaluation metrics saved successfully.\n")
+```
+
+# Class-wise Metrics
+
+```{r}
+# ==========================================================
+# Class-wise Evaluation Metrics
+# ==========================================================
+
+class_metrics <- as.data.frame(conf_matrix$byClass)
+
+class_metrics$Metric <- rownames(class_metrics)
+
+rownames(class_metrics) <- NULL
+
+colnames(class_metrics)[1] <- "Value"
+
+class_metrics
+
+write.csv(
+  class_metrics,
+  file.path(
+    results_dir,
+    "RandomForestBinary_ClassMetrics.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("Class-wise metrics saved successfully.\n")
+```
+
+Because this is now a two-class problem, `conf_matrix$byClass` returns a single named vector — Sensitivity, Specificity, Precision, Recall, F1, Prevalence, Detection Rate, Detection Prevalence, and Balanced Accuracy — computed with CRC as the positive class, rather than a per-class matrix as in the three-class notebook. Balanced Accuracy in particular is a useful complement to overall Accuracy here, since it averages Sensitivity and Specificity and is therefore insensitive to any residual imbalance between the Healthy and CRC sample counts.
+
+# Matthews Correlation Coefficient (MCC)
+
+```{r}
+# ==========================================================
+# Matthews Correlation Coefficient (MCC)
+# ==========================================================
+
+mcc_data <- data.frame(
+  truth = y_test,
+  prediction = rf_binary_predictions
+)
+
+mcc_value <- yardstick::mcc(
+  mcc_data,
+  truth = truth,
+  estimate = prediction
+)
+
+mcc_value
+
+write.csv(
+  mcc_value,
+  file.path(
+    results_dir,
+    "RandomForestBinary_MCC.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("MCC saved successfully.\n")
+```
+
+The Matthews Correlation Coefficient is a balanced summary statistic that accounts for all four cells of the binary confusion matrix simultaneously. A value close to +1 indicates near-perfect classification, 0 indicates performance no better than random assignment, and negative values indicate systematic disagreement between predicted and actual labels.
+
+# ROC Curve
+
+```{r}
+# ==========================================================
+# ROC Curve
+# ==========================================================
+
+roc_binary <- roc(
+  response = y_test,
+  predictor = rf_binary_probabilities$CRC,
+  levels = c("healthy", "CRC")
+)
+
+plot(
+  roc_binary,
+  col = "blue",
+  lwd = 2,
+  main = "ROC Curve - Binary Random Forest (Healthy vs CRC)"
+)
+
+abline(
+  a = 0,
+  b = 1,
+  lty = 2,
+  col = "red"
+)
+```
+
+# Save ROC Plot
+
+```{r}
+# ==========================================================
+# Save ROC Plot
+# ==========================================================
+
+png(
+  file.path(
+    figures_dir,
+    "RandomForestBinary_ROC.png"
+  ),
+  width = 900,
+  height = 700,
+  res = 150
+)
+
+plot(
+  roc_binary,
+  col = "blue",
+  lwd = 2,
+  main = "ROC Curve - Binary Random Forest (Healthy vs CRC)"
+)
+
+abline(
+  a = 0,
+  b = 1,
+  lty = 2,
+  col = "red"
+)
+
+dev.off()
+
+cat("ROC plot saved successfully.\n")
+```
+
+A single ROC curve is sufficient here, unlike the one-vs-rest curves required in the three-class notebook, because CRC vs Healthy is inherently a binary discrimination problem. A curve that bows tightly toward the top-left corner, with AUC close to 1, indicates strong separability of CRC from Healthy samples based on the microbial abundance profile.
+
+# AUC values
+
+```{r}
+# ==========================================================
+# Area Under the Curve (AUC)
+# ==========================================================
+
+auc_binary <- auc(roc_binary)
+
+auc_binary
+```
+
+```{r}
+# ==========================================================
+# Save AUC Values
+# ==========================================================
+
+auc_results <- data.frame(
+  AUC = as.numeric(auc_binary)
+)
+
+auc_results
+
+write.csv(
+  auc_results,
+  file.path(
+    results_dir,
+    "RandomForestBinary_AUC.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("AUC saved successfully.\n")
+```
+
+# ROC Coordinates
+
+```{r}
+# ==========================================================
+# ROC Coordinates
+# ==========================================================
+
+roc_coordinates <- data.frame(
+  Specificity = roc_binary$specificities,
+  Sensitivity = roc_binary$sensitivities,
+  Threshold = roc_binary$thresholds
+)
+
+write.csv(
+  roc_coordinates,
+  file.path(
+    results_dir,
+    "RandomForestBinary_ROC_Coordinates.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("ROC coordinates saved successfully.\n")
+```
+
+# Top Important Biomarkers
+
+```{r}
+# ==========================================================
+# Top Important Biomarkers
+# ==========================================================
+top_biomarkers <- head(
+  var_importance_df_named,
+  20
+) |> 
+  mutate(
+    # Extract genus and species from full taxonomic string
+    Microbe = sub(".*g__", "", Original),
+    Microbe = sub("\\|s__", " ", Microbe),
+    Microbe = sub("\\|.*", "", Microbe),
+    Microbe = gsub("_", " ", Microbe),
+    Microbe = gsub("^([A-Za-z]+)\\.\\1\\s+", "\\1 ", Microbe),
+    Microbe = gsub("\\.", " ", Microbe)
+  )
+
+# If extraction fails (no genus/species tag found), keep original
+top_biomarkers$Microbe[
+  is.na(top_biomarkers$Microbe) | top_biomarkers$Microbe == ""
+] <- top_biomarkers$Feature[
+  is.na(top_biomarkers$Microbe) | top_biomarkers$Microbe == ""
+]
+
+top_biomarkers
+
+write.csv(
+  top_biomarkers,
+  file.path(
+    results_dir,
+    "RandomForestBinary_TopBiomarkers.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("Top biomarkers table saved successfully.\n")
+```
+
+```{r}
+#===============================================================
+# Plot Top Biomarkers
+#===============================================================
+
+biomarker_plot <- ggplot(
+  top_biomarkers,
+  aes(
+    x = reorder(Microbe, MeanImportance),
+    y = MeanImportance,
+    fill = MeanImportance
+  )
+) +
+  geom_col(width = 0.7) +
+  coord_flip() +
+  scale_fill_gradient(
+    low = "lightsteelblue",
+    high = "steelblue4"
+  ) +
+  labs(
+    title = "Top 20 Microbial Biomarkers - Binary Random Forest",
+    subtitle = "Ranked by mean Random Forest variable importance (Healthy vs CRC)",
+    x = "Genus and Species",
+    y = "Mean Importance"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, size = 9),
+    legend.position = "none"
+  )
+
+print(biomarker_plot)
+
+ggsave(
+  filename = file.path(
+    figures_dir,
+    "RandomForestBinary_TopBiomarkers.png"
+  ),
+  plot = biomarker_plot,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+cat("Top biomarkers plot saved successfully.\n")
+```
+
+These 20 taxa are considered important by the binary Random Forest because splitting on them, across hundreds of bootstrap-resampled trees, consistently improved the model's ability to separate Healthy from CRC samples — reflected here as a high mean decrease in classification accuracy/Gini impurity when each feature's values are permuted. Because this importance is computed on the model actually used for prediction (unlike Boruta, which only decided feature inclusion beforehand), this ranking reflects each taxon's realized contribution to the final binary classifier and is the most direct candidate biomarker list produced by this notebook.
+
+# Biological Interpretation of the Binary Classification
+
+Restricting the comparison to Healthy vs CRC, and removing the intermediate Adenoma class, sharpens the classification task relative to the three-class notebook: the model no longer has to draw a boundary through the biologically ambiguous adenoma-to-carcinoma transition, and can instead focus purely on taxa that separate frank disease from a healthy gut microbiome. Taxa that rank highly here but were less prominent in the three-class Random Forest importance ranking are candidates whose association with CRC is diluted, in the multiclass setting, by adenoma samples sharing intermediate abundance levels with both healthy and cancer states. Conversely, taxa that remain highly ranked in both the multiclass and binary analyses are stronger, more robust candidate biomarkers of colorectal cancer, since their discriminative signal persists regardless of whether Adenoma samples are included in training. The AUC obtained in this notebook (`r round(as.numeric(auc_binary), 3)`) provides a direct, binary-only benchmark of separability that is not achievable from a one-vs-rest curve computed on the three-class model, since one-vs-rest CRC curves are still influenced by the presence of Adenoma as a competing class during training.
+
+# Conclusion
+
+This exploratory notebook trained a binary Random Forest classifier restricted to Healthy and CRC samples, using the same near-zero variance filtering, Boruta feature selection, scaling, and repeated 10-fold cross-validation strategy established across the rest of the project, adapted from `multiClassSummary`/Accuracy to `twoClassSummary`/ROC for the two-class setting. On the held-out test set, the model achieved an accuracy of `r round(conf_matrix$overall["Accuracy"], 3)`, a Kappa of `r round(conf_matrix$overall["Kappa"], 3)`, and an AUC of `r round(as.numeric(auc_binary), 3)`, with `r length(selected_features)` microbial features surviving Boruta selection on the binary training data. As a secondary, exploratory analysis, this notebook does not replace the three-class Random Forest evaluation; instead it isolates the Healthy-vs-CRC signal to identify which candidate biomarkers are most robust to the removal of Adenoma as an intermediate disease state, and to establish a binary Random Forest benchmark directly comparable to the binary Logistic Regression baseline trained on the same two classes.
+
+# Session Information
+
+```{r}
+# ==========================================================
+# Session Information
+# ==========================================================
+
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(
+    reports_dir,
+    "RandomForestBinary_SessionInfo.txt"
+  )
+)
+
+sessionInfo()
+```
+
+## Session information
+
+The final section records the exact R session used for this knit. The same information is also saved as a text artifact so the HTML report and repository contain both a human-readable and machine-readable provenance record.
+
+```{r session-information}
+session_file <- file.path(
+  results_dir,
+  "session_info",
+  "02_Binary_RandomForest_CRC_vs_Healthy_sessionInfo.txt"
+)
+write_session_info(session_file)
+cat("Saved session information to:", session_file, "\n\n")
+sessionInfo()
+```

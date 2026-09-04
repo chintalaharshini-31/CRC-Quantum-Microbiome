@@ -1,0 +1,1594 @@
+---
+title: "XGBoost Classification for Colorectal Cancer vs Healthy Microbiome Classification (Binary Exploratory Analysis)"
+author: "Harshini Chintala"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    theme: cosmo
+    highlight: tango
+    df_print: paged
+    fig_caption: true
+    self_contained: true
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  collapse = TRUE,
+  comment = "##",
+  fig.width = 7.2,
+  fig.height = 5.2,
+  dpi = 300,
+  fig.align = "center",
+  out.width = "92%",
+  results = "markup"
+)
+
+options(width = 90, scipen = 999)
+source("../../R/project_setup.R")
+set.seed(1910)
+
+# Classical notebook output locations.
+project_dir <- classical_dir
+results_dir <- file.path(classical_dir, "results")
+models_dir <- file.path(classical_dir, "models")
+data_dir <- file.path(classical_dir, "data")
+reports_dir <- file.path(classical_dir, "reports")
+figures_dir <- file.path(classical_dir, "figures")
+for (d in c(results_dir, models_dir, data_dir, reports_dir, figures_dir)) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+
+```
+
+## Notebook roadmap
+
+**Purpose:** This notebook is one reproducible component of the CRC microbiome classification pipeline.
+
+**Execution order**
+1. Load the project environment and fixed random seed (`1910`).
+2. Load only the validated project artifacts required for this analysis.
+3. Perform the analysis exactly as documented below.
+4. Generate tables/figures and save machine-readable outputs.
+5. Record the session information used for the run.
+
+**Output contract:** generated tables, figures, model objects, audit files, and session information are written under `02 Classical ML/results/`. The notebook itself renders to HTML with a floating table of contents, so the sections can be navigated from the left-hand panel in the knitted document.
+
+**Reproducibility rule:** this repository preserves the validated analysis logic and project-wide seed. Environment restoration is handled by `renv.lock` for R and `requirements.txt` for Python. The notebooks do not silently install unpinned packages during knitting.
+
+### Reproducibility constants
+
+- Project seed: **1910**
+- Discovery cohort: **ZellerG_2014**
+- Primary task: **Healthy vs CRC; adenoma excluded**
+- Frozen discovery split: **92 training / 22 held-out test samples**
+- Primary feature panel: **20 Boruta-selected features**
+- External cohorts: **FengQ_2015** and **VogtmannE_2016**
+
+# Introduction
+
+XGBoost (Extreme Gradient Boosting) is a supervised ensemble learning algorithm that builds decision trees sequentially, where each new tree is trained to correct the residual errors of the ensemble built so far, rather than being grown independently as in Random Forest. Trees are added additively and regularized (via `gamma`, `min_child_weight`, and shrinkage `eta`) to control overfitting, which is particularly important given the small sample size relative to the number of candidate microbial features in this dataset.
+
+**Biological objective:** This notebook is a secondary, exploratory analysis of the same Zeller et al. (2014) gut microbiome dataset used throughout this project. Rather than the full three-class problem (Healthy, Adenoma, CRC) evaluated in the main XGBoost notebook, Adenoma samples are excluded entirely and the model is restricted to a simpler, sharper biological question: does the gut microbial abundance profile distinguish colorectal cancer (CRC) patients from healthy controls?
+
+**Machine learning objective:** Train and validate a binary XGBoost classifier using the same preprocessing pipeline and reporting structure as the finalized Binomial Logistic Regression notebook and the binary Random Forest notebook, so that binary XGBoost performance is directly comparable to those binary baselines. This notebook is a standalone exploratory supplement and does not replace or modify the existing multiclass XGBoost notebook; all objects, models, and output files use a distinct `_Binary` naming convention to avoid any collision with the three-class analysis.
+
+**Why this notebook uses native `xgboost` instead of `caret::train(method = "xgbTree")`:** The multiclass XGBoost notebook trains via `caret::train()`, which internally calls the `xgboost` package's scikit-learn-style wrapper. On the current R and `xgboost` package versions used for this exploratory analysis, that caret/xgboost integration path produces `NA` tuning results during grid search. To keep this notebook robust and reproducible, model training here is implemented directly against the native `xgboost` API (`xgb.DMatrix`, `xgb.cv`, `xgb.train`), bypassing `caret::train()` entirely for the modeling step while still using `caret` elsewhere in the pipeline (near-zero variance filtering, data partitioning, scaling, and `confusionMatrix()`), exactly as in every other notebook in this project.
+
+**Why XGBoost is appropriate for microbiome abundance data:** Like Random Forest, XGBoost handles high-dimensional, collinear, sparse, and non-linear feature spaces natively, without requiring the linearity assumptions of logistic regression. Unlike Random Forest's independent bagged trees, XGBoost's boosted trees are fit sequentially to the current residual error, which often yields sharper decision boundaries and stronger predictive performance when the signal-to-noise ratio is favorable, at the cost of being more sensitive to hyperparameter choices (learning rate, tree depth, regularization) and more prone to overfitting on small sample sizes if left untuned. Explicit, deliberate hyperparameter tuning with early stopping is therefore essential and is performed via a full grid search below.
+
+This notebook implements a complete native XGBoost workflow including data preprocessing, Boruta feature selection, DMatrix construction, cross-validated hyperparameter tuning with early stopping, final model training, prediction, performance evaluation, ROC analysis, and interpretation of microbial biomarkers.
+
+
+
+
+
+# Import Dataset
+
+```{r}
+# ==========================================================
+# Load Dataset
+# ==========================================================
+
+library(curatedMetagenomicData)
+library(TreeSummarizedExperiment)
+library(caret)
+library(xgboost)
+library(pROC)
+library(ggplot2)
+library(dplyr)
+library(Boruta)
+
+# Download/load Zeller dataset
+zeller <- curatedMetagenomicData(
+  "ZellerG_2014.relative_abundance",
+  dryrun = FALSE
+)[[1]]
+
+# Extract abundance matrix
+abundance <- assay(zeller)
+
+# Transpose:
+# Rows = samples
+# Columns = microbial species
+X <- as.data.frame(t(abundance))
+
+# Disease labels
+y <- colData(zeller)$study_condition
+
+# Combine into one dataframe
+crc_data <- X
+crc_data$disease <- y
+
+# Check dimensions
+dim(crc_data)
+
+# Class distribution
+table(crc_data$disease)
+```
+
+The Zeller et al. (2014) colorectal cancer dataset consists of 652 microbial relative-abundance features measured across 156 stool samples, spanning three disease states: healthy controls, adenoma, and colorectal cancer.
+
+# Create Binary Dataset
+
+```{r}
+# ==========================================================
+# Create Binary Dataset (Healthy vs CRC only)
+# ==========================================================
+
+binary_data <- crc_data %>%
+  # Rename "control" to "healthy" before filtering
+  mutate(disease = case_match(disease, "control" ~ "healthy", .default = disease)) %>%
+  # Keep only Healthy and CRC — Adenoma is excluded completely
+  filter(disease %in% c("healthy", "CRC"))
+
+# Drop unused factor levels so "adenoma" is removed completely
+binary_data$disease <- factor(binary_data$disease)
+
+# Check dimensions
+dim(binary_data)
+
+# Verify class distribution
+table(binary_data$disease)
+```
+
+Adenoma samples are removed entirely before any preprocessing, scaling, feature selection, training, tuning, or evaluation takes place, so that no information from the excluded class can leak into the binary pipeline. This mirrors the class handling used in the Binomial Logistic Regression notebook and the binary Random Forest notebook, restricting the problem to a direct Healthy vs CRC comparison.
+
+# Train-Test Split
+
+```{r}
+# ==========================================================
+# Train-Test Split (shared across binary model notebooks)
+# ==========================================================
+
+train_index_path <- file.path(models_dir, "BinaryClass_Train_Index.rds")
+
+if (file.exists(train_index_path)) {
+
+  # Reuse the same split used by any other binary model notebook
+  train_index <- readRDS(train_index_path)
+
+} else {
+
+  # First notebook to run creates and saves the shared binary split
+  set.seed(1910)
+
+  train_index <- createDataPartition(
+    binary_data$disease,
+    p = 0.80,
+    list = FALSE
+  )
+
+  saveRDS(train_index, train_index_path)
+
+}
+
+# Training dataset
+train_data <- binary_data[train_index, ]
+
+# Testing dataset
+test_data <- binary_data[-train_index, ]
+
+# Check dimensions
+dim(train_data)
+dim(test_data)
+
+# Verify class distribution
+prop.table(table(train_data$disease))
+prop.table(table(test_data$disease))
+```
+
+An 80:20 stratified split preserves the relative proportions of Healthy and CRC samples in both the training and testing sets. `train_index` is cached under the shared `BinaryClass_Train_Index.rds` file — the same file created by the binary Random Forest notebook — and reused here, so that every binary classifier in this project (Random Forest and XGBoost alike) is trained and evaluated on identical data partitions for a fair comparison.
+
+# Separate Features and Labels
+
+```{r}
+# ==========================================================
+# Separate Features and Labels
+# ==========================================================
+
+# Training features
+X_train_raw <- train_data %>%
+  select(-disease)
+
+# Testing features
+X_test_raw <- test_data %>%
+  select(-disease)
+
+# Training labels
+y_train <- train_data$disease
+
+# Testing labels
+y_test <- test_data$disease
+
+# Check dimensions
+cat("Training Features:", dim(X_train_raw), "\n")
+cat("Testing Features :", dim(X_test_raw), "\n")
+
+# Check class distribution
+table(y_train)
+table(y_test)
+```
+
+# Near Zero Variance Removal
+
+```{r}
+# ==========================================================
+# Remove Near-Zero Variance Features
+# ==========================================================
+
+# Identify near-zero variance predictors (training data only)
+nzv <- nearZeroVar(X_train_raw)
+
+cat("Number of Near-Zero Variance Features:", length(nzv), "\n")
+
+# Remove them from training and testing data
+if (length(nzv) > 0) {
+
+  X_train_nzv <- X_train_raw[, -nzv]
+  X_test_nzv  <- X_test_raw[, -nzv]
+
+} else {
+
+  X_train_nzv <- X_train_raw
+  X_test_nzv  <- X_test_raw
+
+}
+
+# Check updated dimensions
+cat("Training Features:", dim(X_train_nzv), "\n")
+cat("Testing Features :", dim(X_test_nzv), "\n")
+```
+
+Near-zero variance filtering is computed exclusively on the training data to avoid information leakage from the test set. Microbial abundance data typically contains many taxa that are absent or nearly constant across almost all samples; these features carry little discriminative signal, can destabilize resampling-based model training, and are removed before feature selection. The same columns identified from the training data are then dropped from the test data so that both sets retain an identical feature space.
+
+# Feature Selection using Boruta
+
+```{r}
+# ==========================================================
+# Feature Selection using Boruta (training data only)
+# ==========================================================
+
+set.seed(1910)
+
+boruta_data <- data.frame(
+  Disease = y_train,
+  X_train_nzv,
+  check.names = FALSE
+)
+
+boruta_model <- Boruta(
+  Disease ~ .,
+  data = boruta_data,
+  doTrace = 2
+)
+
+boruta_final <- TentativeRoughFix(boruta_model)
+
+selected_features <- getSelectedAttributes(
+  boruta_final,
+  withTentative = FALSE
+)
+
+cat("Number of selected features:",
+    length(selected_features), "\n")
+
+print(selected_features)
+
+X_train_boruta <- X_train_nzv[, selected_features, drop = FALSE]
+
+X_test_boruta <- X_test_nzv[, selected_features, drop = FALSE]
+```
+
+```{r}
+saveRDS(
+  boruta_model,
+  file.path(
+    models_dir,
+    "Boruta_Model_Binary_XGB.rds"
+  )
+)
+
+cat("Boruta model saved successfully.\n")
+```
+
+```{r}
+# ==========================================================
+# Save Selected Features
+# ==========================================================
+
+selected_features_df <- data.frame(
+  Feature = selected_features
+)
+
+write.csv(
+  selected_features_df,
+  file.path(
+    results_dir,
+    "XGBoostBinary_Selected_Features.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("Selected features saved successfully.\n")
+```
+
+Boruta is used here as the dedicated preprocessing feature-selection step, exactly as in the Binomial, Multinomial, Elastic Net, Random Forest, and multiclass XGBoost notebooks. It works by comparing the importance of each real feature against randomized "shadow" copies of that feature across repeated Random Forest runs (Boruta's internal test model is always a Random Forest, regardless of which model is ultimately trained downstream), retaining only predictors that are confirmed to carry more signal than noise. Because the Healthy vs CRC comparison is a different, simpler classification problem than the three-class task, Boruta is re-run here on the binary training data rather than reusing the three-class selected feature set — the confirmed features may therefore differ from the multiclass notebook. This step is kept strictly separate from XGBoost feature importance computed later on the final trained model: Boruta is a preprocessing filter that decides *which* features enter the model, while the post-training XGBoost importance section interprets *how* the final boosted ensemble used those already-selected features. `TentativeRoughFix()` forces a final decision on any features left "Tentative" after the confirmed run, and `getSelectedAttributes()` extracts the confirmed feature set that is carried forward into scaling and model training.
+
+# Feature Scaling
+
+```{r}
+# ==========================================================
+# Feature Scaling
+# ==========================================================
+# Like Random Forest, XGBoost's tree splits are threshold-based
+# and therefore insensitive to monotonic feature scaling. This
+# step is retained anyway to keep the preprocessing pipeline
+# identical across every model notebook in the project (Binomial,
+# Multinomial, Elastic Net, Random Forest, and XGBoost), so that
+# any downstream comparison of preprocessing artifacts (e.g. the
+# scaler, the feature name map) is consistent regardless of
+# which model is being evaluated.
+
+# Learn scaling parameters from training data only
+scaler <- preProcess(
+  X_train_boruta,
+  method = c("center", "scale")
+)
+
+# Scale training and testing data
+X_train_scaled <- predict(
+  scaler,
+  X_train_boruta
+)
+
+X_test_scaled <- predict(
+  scaler,
+  X_test_boruta
+)
+
+saveRDS(
+  scaler,
+  file.path(
+    models_dir,
+    "Scaler_Binary_XGB.rds"
+  )
+)
+
+cat("Training and testing data scaled successfully.\n")
+```
+
+# Standardize Feature Names
+
+```{r}
+# ==========================================================
+# Standardize Feature Names
+# ==========================================================
+
+feature_name_map <- data.frame(
+  Original = colnames(X_train_scaled),
+  Syntactic = make.names(
+    colnames(X_train_scaled),
+    unique = TRUE
+  ),
+  stringsAsFactors = FALSE
+)
+
+colnames(X_train_scaled) <- feature_name_map$Syntactic
+colnames(X_test_scaled) <- feature_name_map$Syntactic
+
+write.csv(
+  feature_name_map,
+  file.path(
+    results_dir,
+    "XGBoostBinary_FeatureNameMap.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("Feature names standardized successfully.\n")
+```
+
+Full microbial taxonomic strings (e.g. `k__Bacteria|p__Firmicutes|...|s__Faecalibacterium_prausnitzii`) contain characters that are not syntactically valid R column names. `make.names()` converts every feature name into a valid identifier while `feature_name_map` preserves the original taxonomic string so it can be restored for reporting and plotting later in the notebook.
+
+# Create Training and Testing Data Frames
+
+```{r}
+# ==========================================================
+# Create Training and Testing Data Frames
+# ==========================================================
+
+train_df <- data.frame(
+    X_train_scaled,
+    disease = y_train
+)
+
+test_df <- data.frame(
+  X_test_scaled,
+  disease = y_test
+)
+
+str(train_df)
+str(test_df)
+```
+
+# Prepare DMatrix Objects for Native XGBoost
+
+```{r}
+# ==========================================================
+# Binary Label Encoding
+# ==========================================================
+# Native xgboost requires a numeric 0/1 label rather than a
+# factor. Healthy = 0, CRC = 1, matching the "positive = CRC"
+# convention already used for confusionMatrix() throughout
+# this project.
+
+y_train_label <- ifelse(y_train == "CRC", 1, 0)
+y_test_label  <- ifelse(y_test == "CRC", 1, 0)
+
+table(y_train_label)
+table(y_test_label)
+```
+
+```{r}
+# ==========================================================
+# Build DMatrix Objects
+# ==========================================================
+
+train_matrix <- as.matrix(X_train_scaled)
+test_matrix  <- as.matrix(X_test_scaled)
+
+dtrain <- xgb.DMatrix(data = train_matrix, label = y_train_label)
+dtest  <- xgb.DMatrix(data = test_matrix,  label = y_test_label)
+
+dtrain
+dtest
+```
+
+This notebook trains against the native `xgboost` API rather than `caret::train(method = "xgbTree")`, because that caret/xgboost integration path is currently incompatible with the installed `xgboost` package version and produces `NA` tuning results. `xgb.DMatrix` is XGBoost's native, memory-efficient internal data structure; building it directly from the scaled, Boruta-selected training and testing matrices, with an explicit numeric 0/1 label (Healthy = 0, CRC = 1), avoids the caret wrapper entirely while preserving every upstream preprocessing step (near-zero variance filtering, Boruta selection, scaling, feature-name standardization) used by every other notebook in this project.
+
+# Shared Cross-Validation Folds
+
+```{r}
+# ==========================================================
+# Shared Repeated CV Folds (reused across binary model
+# notebooks for a fair, identical resampling comparison)
+# ==========================================================
+
+cv_folds_path <- file.path(models_dir, "BinaryClass_CV_Folds.rds")
+
+if (file.exists(cv_folds_path)) {
+
+  # Reuse the same folds used by the binary Random Forest notebook
+  cv_folds <- readRDS(cv_folds_path)
+
+} else {
+
+  # First notebook to run creates and saves the shared folds
+  set.seed(1910)
+
+  cv_folds <- createMultiFolds(
+    y_train,
+    k = 10,
+    times = 5
+  )
+
+  saveRDS(cv_folds, cv_folds_path)
+
+}
+```
+
+Repeated 10-fold cross-validation (5 repeats) is the resampling scheme shared across every binary classifier in this project. The predefined fold indices are cached under `BinaryClass_CV_Folds.rds` and reused here from the binary Random Forest notebook, so that Random Forest and XGBoost are evaluated on identical resampling partitions.
+
+# Convert Folds for Native XGBoost
+
+```{r}
+# ==========================================================
+# Convert Shared caret CV Indices to Validation Indices
+# ==========================================================
+# caret::createMultiFolds() stores TRAINING indices.
+# For XGBoost, we derive the corresponding held-out
+# validation indices for all 10 folds × 5 repeats.
+
+xgb_cv_folds <- lapply(
+  cv_folds,
+  function(train_idx) {
+    setdiff(
+      seq_len(nrow(train_matrix)),
+      train_idx
+    )
+  }
+)
+
+length(xgb_cv_folds)
+
+sapply(xgb_cv_folds, length)
+```
+
+Each element of xgb_cv_folds contains the held-out validation indices for one resampling fold from the shared repeated 10-fold cross-validation scheme. In total, xgb_cv_folds contains 50 validation folds representing 10 folds repeated 5 times, in the exact format required by xgb.cv(). This keeps the hyperparameter search grounded in the same underlying fold structure used elsewhere in the project while keeping the grid search computationally tractable.
+
+```{r}
+# ==========================================================
+# Validate XGBoost Cross-Validation Fold Structure
+# ==========================================================
+
+cat("Number of CV folds:", length(xgb_cv_folds), "\n")
+
+# Each validation fold should contain 1/10 of 92 = approximately 9 samples
+cat("\nValidation fold sizes:\n")
+print(sapply(xgb_cv_folds, length))
+
+# Every validation index must be valid
+all_indices_valid <- all(
+  sapply(
+    xgb_cv_folds,
+    function(idx) all(
+      idx >= 1 &
+      idx <= nrow(train_matrix)
+    )
+  )
+)
+
+cat(
+  "\nAll validation indices valid:",
+  all_indices_valid,
+  "\n"
+)
+
+# Check that no validation fold is empty
+no_empty_folds <- all(
+  sapply(
+    xgb_cv_folds,
+    length
+  ) > 0
+)
+
+cat(
+  "No empty validation folds:",
+  no_empty_folds,
+  "\n"
+)
+
+# Check that the five repeats × ten folds are present
+stopifnot(
+  length(xgb_cv_folds) == 50
+)
+
+# Check that every validation fold is complementary
+# to its corresponding caret training fold
+fold_complementarity <- mapply(
+  function(train_idx, validation_idx) {
+
+    identical(
+      sort(
+        setdiff(
+          seq_len(nrow(train_matrix)),
+          train_idx
+        )
+      ),
+      sort(validation_idx)
+    )
+
+  },
+  cv_folds,
+  xgb_cv_folds
+)
+
+cat(
+  "All folds correctly converted to validation indices:",
+  all(fold_complementarity),
+  "\n"
+)
+
+# Final assertions
+stopifnot(
+  length(xgb_cv_folds) == 50,
+  all_indices_valid,
+  no_empty_folds,
+  all(fold_complementarity)
+)
+
+cat(
+  "\nXGBoost CV fold structure validated successfully.\n"
+)
+```
+
+```{r}
+# ==========================================================
+# Inspect Class Balance Within Validation Folds
+# ==========================================================
+
+validation_class_counts <- lapply(
+  xgb_cv_folds,
+  function(idx) {
+    table(
+      y_train[idx]
+    )
+  }
+)
+
+validation_class_counts
+```
+
+```{r}
+all_folds_have_both_classes <- all(
+  sapply(
+    xgb_cv_folds,
+    function(idx) {
+      length(
+        unique(
+          y_train[idx]
+        )
+      ) == 2
+    }
+  )
+)
+
+cat(
+  "Every validation fold contains both classes:",
+  all_folds_have_both_classes,
+  "\n"
+)
+
+stopifnot(all_folds_have_both_classes)
+```
+
+
+# Hyperparameter Tuning with Cross-Validation and Early Stopping
+
+```{r}
+# ==========================================================
+# Explicit Hyperparameter Tuning Grid
+# ==========================================================
+# Hyperparameter tuning explores tree complexity, learning rate,
+# regularization, and row/feature sampling. nrounds is not
+# grid-searched directly; instead, xgb.cv() is run with a
+# generous maximum number of boosting rounds and early stopping
+# is used to select the optimal number of boosting rounds.
+
+tune_grid <- expand.grid(
+  max_depth        = c(2, 3, 5),
+  eta              = c(0.05, 0.1),
+  gamma            = c(0, 0.5),
+  colsample_bytree = c(0.5, 0.8),
+  min_child_weight = 1,
+  subsample        = c(0.8, 1.0)
+)
+
+tune_grid
+```
+
+```{r}
+# ==========================================================
+# Grid Search via xgb.cv() with Early Stopping
+# ==========================================================
+
+set.seed(1910)
+
+tuning_results <- list()
+
+for (i in seq_len(nrow(tune_grid))) {
+
+  cat("\nRunning Grid Row:", i, "\n")
+
+  params <- list(
+    objective        = "binary:logistic",
+    eval_metric      = "auc",
+    max_depth        = tune_grid$max_depth[i],
+    eta              = tune_grid$eta[i],
+    gamma            = tune_grid$gamma[i],
+    colsample_bytree = tune_grid$colsample_bytree[i],
+    min_child_weight = tune_grid$min_child_weight[i],
+    subsample        = tune_grid$subsample[i]
+  )
+
+  cv_fit <- xgb.cv(
+    params = params,
+    data = dtrain,
+    nrounds = 1000,
+    folds = xgb_cv_folds,
+    early_stopping_rounds = 20,
+    maximize = TRUE,
+    verbose = 0
+  )
+
+  # Find the best iteration manually
+  best_iter <- which.max(cv_fit$evaluation_log$test_auc_mean)
+  best_auc  <- max(cv_fit$evaluation_log$test_auc_mean)
+
+  tuning_results[[i]] <- data.frame(
+    max_depth        = tune_grid$max_depth[i],
+    eta              = tune_grid$eta[i],
+    gamma            = tune_grid$gamma[i],
+    colsample_bytree = tune_grid$colsample_bytree[i],
+    min_child_weight = tune_grid$min_child_weight[i],
+    subsample        = tune_grid$subsample[i],
+    best_nrounds     = best_iter,
+    best_cv_auc = best_auc
+  )
+
+}
+
+xgb_cv_summary <- dplyr::bind_rows(tuning_results)
+
+xgb_cv_summary <- xgb_cv_summary %>%
+  dplyr::arrange(
+    dplyr::desc(best_cv_auc),
+    best_nrounds,
+    max_depth,
+    eta
+  )
+
+print(xgb_cv_summary)
+
+write.csv(
+  xgb_cv_summary,
+  file.path(
+    results_dir,
+    "XGBoostBinary_CV_TuningResults.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("Cross-validation tuning results saved successfully.\n")
+```
+
+Each element of xgb_cv_folds contains the held-out validation indices for one resampling fold from the shared repeated 10-fold cross-validation scheme. In total, xgb_cv_folds contains 50 validation folds representing 10 folds repeated 5 times, in the exact format required by xgb.cv(). This keeps the hyperparameter search grounded in the same underlying fold structure used elsewhere in the project while keeping the grid search computationally tractable.
+
+
+# Train Final XGBoost Model
+
+```{r}
+# ==========================================================
+# Select Best Hyperparameters
+# ==========================================================
+
+best_params_row <- xgb_cv_summary[1, ]
+
+best_params_row
+
+best_nrounds <- best_params_row$best_nrounds
+```
+
+```{r}
+# ==========================================================
+# Train Final Binary XGBoost Model (native xgboost)
+# ==========================================================
+
+final_params <- list(
+  objective        = "binary:logistic",
+  eval_metric      = "auc",
+  max_depth        = best_params_row$max_depth,
+  eta              = best_params_row$eta,
+  gamma            = best_params_row$gamma,
+  colsample_bytree = best_params_row$colsample_bytree,
+  min_child_weight = best_params_row$min_child_weight,
+  subsample        = best_params_row$subsample
+)
+
+set.seed(1910)
+
+xgb_binary_model <- xgb.train(
+  params  = final_params,
+  data    = dtrain,
+  nrounds = best_nrounds
+)
+
+cat("Binary XGBoost model trained successfully using native xgb.train() with cross-validated, early-stopped hyperparameters.\n")
+
+xgb_binary_model
+```
+
+All 48 candidate configurations achieved a maximum cross-validated AUC of 1.00. Because the CV criterion did not distinguish among these configurations, the final configuration was selected using a prespecified deterministic tie-breaking rule that prioritized the fewest boosting rounds, followed by shallower tree depth.
+```{r}
+# ==========================================================
+# Select Final Hyperparameters
+# ==========================================================
+
+# All candidate configurations reached the same maximum
+# cross-validated AUC. Therefore, the final configuration
+# is selected using a deterministic secondary criterion:
+# among tied configurations, choose the one requiring the
+# fewest boosting rounds, followed by lower tree depth.
+
+max_cv_auc <- max(
+  xgb_cv_summary$best_cv_auc
+)
+
+tied_configs <- xgb_cv_summary %>%
+  dplyr::filter(
+    best_cv_auc == max_cv_auc
+  )
+
+cat(
+  "Number of configurations tied at maximum CV AUC:",
+  nrow(tied_configs),
+  "\n"
+)
+
+xgb_cv_summary <- xgb_cv_summary %>%
+  dplyr::arrange(
+    dplyr::desc(best_cv_auc),
+    best_nrounds,
+    max_depth,
+    eta
+  )
+
+best_params_row <- xgb_cv_summary[1, ]
+
+best_nrounds <- best_params_row$best_nrounds
+
+cat(
+  "Selected configuration:\n"
+)
+
+print(best_params_row)
+```
+
+
+
+
+```{r}
+# ==========================================================
+# Save Final XGBoost Hyperparameters
+# ==========================================================
+
+xgb_final_hyperparameters <- data.frame(
+  max_depth = best_params_row$max_depth,
+  eta = best_params_row$eta,
+  gamma = best_params_row$gamma,
+  colsample_bytree = best_params_row$colsample_bytree,
+  min_child_weight = best_params_row$min_child_weight,
+  subsample = best_params_row$subsample,
+  nrounds = best_params_row$best_nrounds,
+  best_cv_auc = best_params_row$best_cv_auc
+)
+
+output_file <- file.path(
+  results_dir,
+  "XGBoostBinary_Final_Hyperparameters.csv"
+)
+
+write.csv(
+  xgb_final_hyperparameters,
+  output_file,
+  row.names = FALSE
+)
+
+cat("Final XGBoost hyperparameters saved to:\n")
+cat(normalizePath(output_file, mustWork = FALSE), "\n")
+
+cat(
+  "File exists:",
+  file.exists(output_file),
+  "\n"
+)
+
+cat("Final XGBoost hyperparameters saved successfully.\n")
+```
+
+```{r}
+# ==========================================================
+# Inspect One XGBoost CV Configuration
+# ==========================================================
+
+set.seed(1910)
+
+params_test <- list(
+  objective        = "binary:logistic",
+  eval_metric      = "auc",
+  max_depth        = tune_grid$max_depth[1],
+  eta              = tune_grid$eta[1],
+  gamma            = tune_grid$gamma[1],
+  colsample_bytree = tune_grid$colsample_bytree[1],
+  min_child_weight = tune_grid$min_child_weight[1],
+  subsample        = tune_grid$subsample[1]
+)
+
+cv_test <- xgb.cv(
+  params = params_test,
+  data = dtrain,
+  nrounds = 1000,
+  folds = xgb_cv_folds,
+  early_stopping_rounds = 20,
+  maximize = TRUE,
+  verbose = 0
+)
+
+print(cv_test$evaluation_log)
+```
+
+```{r}
+# Best CV AUC and iteration for this one configuration
+best_test_iter <- which.max(
+  cv_test$evaluation_log$test_auc_mean
+)
+
+best_test_auc <- max(
+  cv_test$evaluation_log$test_auc_mean
+)
+
+cat(
+  "Best iteration:",
+  best_test_iter,
+  "\n"
+)
+
+cat(
+  "Best test AUC:",
+  best_test_auc,
+  "\n"
+)
+```
+
+```{r}
+head(
+  cv_test$evaluation_log[
+    ,
+    c("iter", "train_auc_mean", "test_auc_mean")
+  ],
+  20
+)
+```
+
+
+# Save Trained Model
+
+```{r}
+# ==========================================================
+# Save Trained Model
+# ==========================================================
+# Native xgb.Booster objects are saved with xgb.save() rather
+# than saveRDS(), since xgb.save()/xgb.load() is the officially
+# supported, version-stable round-trip method for native
+# xgboost models, unlike the caret-wrapped train object saved
+# via saveRDS() in the other notebooks.
+
+xgb.save(
+  xgb_binary_model,
+  file.path(
+    models_dir,
+    "XGBoostBinary_Model.model"
+  )
+)
+
+# Final hyperparameters and nrounds are also saved as an RDS
+# object for full reproducibility of the training call above.
+saveRDS(
+  list(params = final_params, nrounds = best_nrounds),
+  file.path(
+    models_dir,
+    "XGBoostBinary_Model_Params.rds"
+  )
+)
+
+cat("Model saved successfully.\n")
+```
+
+# XGBoost Feature Importance
+
+```{r}
+# ==========================================================
+# XGBoost Feature Importance
+# ==========================================================
+# This is distinct from the Boruta feature-selection step above.
+# Boruta decided WHICH features entered the model; this section
+# interprets HOW the trained boosted ensemble used those features.
+
+xgb_importance <- xgb.importance(
+  feature_names = colnames(train_matrix),
+  model = xgb_binary_model
+)
+
+xgb_importance
+
+var_imp_df_named <-
+  as.data.frame(xgb_importance) %>%
+  dplyr::rename(Syntactic = Feature) %>%
+  dplyr::left_join(feature_name_map, by = "Syntactic") %>%
+  dplyr::mutate(
+    Original = dplyr::if_else(is.na(Original), Syntactic, Original)
+  ) %>%
+  dplyr::select(-Syntactic) %>%
+  dplyr::relocate(Original) %>%
+  dplyr::rename(Feature = Original)
+
+# Ranked complete importance table (Gain is the primary measure)
+var_imp_df_named <- var_imp_df_named[
+  order(var_imp_df_named$Gain, decreasing = TRUE),
+]
+
+write.csv(
+  var_imp_df_named,
+  file.path(
+    results_dir,
+    "XGBoostBinary_VariableImportance.csv"
+  ),
+  row.names = FALSE
+)
+
+# Top 20 microbial biomarkers by XGBoost importance
+top20_importance <- head(var_imp_df_named, 20)
+
+top20_importance
+
+cat("XGBoost variable importance saved successfully.\n")
+```
+
+`xgb.importance()` reports three complementary measures for each feature: **Gain** is the average improvement in the model's loss function contributed by a feature across all splits where it is used, and is the most direct measure of a feature's predictive contribution; **Cover** is the average number of samples affected by splits on that feature, relative to the total; and **Frequency** is simply how often a feature is used to split across all trees, regardless of how much that split improved the model. A feature can be split on frequently (high Frequency) while contributing little to accuracy (low Gain), so **Gain is used as the primary importance measure** in this notebook, consistent with standard XGBoost interpretation practice and with the multiclass XGBoost notebook, unless Cover or Frequency reveal a meaningfully different pattern worth noting.
+
+# Feature Importance Plot
+
+```{r}
+# ==========================================================
+# Feature Importance Plot
+# ==========================================================
+
+importance_plot_df <- top20_importance
+
+importance_plot <- ggplot(
+  importance_plot_df,
+  aes(
+    x = reorder(Feature, Gain),
+    y = Gain
+  )
+) +
+  geom_col(width = 0.7, fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Top 20 Features by XGBoost Importance (Gain) — Binary: Healthy vs CRC",
+    x = "Feature",
+    y = "Gain"
+  ) +
+  theme_minimal(base_size = 12)
+
+print(importance_plot)
+
+ggsave(
+  filename = file.path(
+    figures_dir,
+    "XGBoostBinary_VariableImportance.png"
+  ),
+  plot = importance_plot,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+cat("Feature importance plot saved successfully.\n")
+```
+
+The top-ranked features represent the microbial taxa that contributed the largest average improvement in classification loss when the boosted ensemble split on them, across all trees and boosting rounds, when separating Healthy from CRC samples specifically. These are candidate microbiome biomarkers and are examined further, with cleaned taxonomic names, in the Top Important Biomarkers section at the end of this notebook.
+
+# Generate Predictions
+
+```{r}
+# ==========================================================
+# Generate Predictions
+# ==========================================================
+
+# Predict CRC-class probabilities
+binary_probabilities <- predict(
+  xgb_binary_model,
+  newdata = dtest
+)
+
+# Convert probabilities to predicted classes (threshold = 0.5)
+binary_predictions <- factor(
+  ifelse(binary_probabilities >= 0.5, "CRC", "healthy"),
+  levels = levels(y_test)
+)
+
+# Preview predictions
+head(binary_probabilities)
+
+head(binary_predictions)
+
+table(binary_predictions)
+```
+
+```{r}
+# ==========================================================
+# Save Predictions
+# ==========================================================
+
+prediction_results <- data.frame(
+  SampleID = rownames(test_data),
+  Actual = y_test,
+  Predicted = binary_predictions,
+  Probability_CRC = binary_probabilities,
+  Probability_Healthy = 1 - binary_probabilities,
+  row.names = NULL
+)
+write.csv(
+  prediction_results,
+  file.path(
+    results_dir,
+    "XGBoostBinary_Predictions.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("Predictions saved successfully.\n")
+```
+
+Native `xgboost`'s `predict()` returns a single numeric vector: the predicted probability of the positive class (CRC = 1) under the `binary:logistic` objective used above. Thresholding this probability at 0.5 converts it into a hard Healthy/CRC class prediction, and the resulting factor is built with the same level ordering (`levels(y_test)`) as the true labels so that `confusionMatrix()` and `pROC::roc()` treat CRC as the positive class exactly as in the Binomial Logistic Regression and binary Random Forest notebooks.
+
+# Confusion Matrix
+
+```{r}
+# ==========================================================
+# Confusion Matrix
+# ==========================================================
+
+conf_matrix <- confusionMatrix(
+  binary_predictions,
+  y_test,
+  positive = "CRC"
+)
+
+conf_matrix
+```
+
+```{r}
+# ==========================================================
+# Save Confusion Matrix
+# ==========================================================
+
+capture.output(
+  conf_matrix,
+  file = file.path(
+    results_dir,
+    "XGBoostBinary_ConfusionMatrix.txt"
+  )
+)
+
+cat("Confusion matrix saved successfully.\n")
+```
+
+The confusion matrix reports agreement between the binary XGBoost model's predicted disease labels and the true labels on the held-out 20% test set, along with overall Accuracy, Kappa, and Sensitivity/Specificity computed by `caret::confusionMatrix()`, with CRC set as the positive class, consistent with the Binomial Logistic Regression and binary Random Forest notebooks.
+
+# Confusion Matrix Heatmap
+
+```{r}
+# ==========================================================
+# Confusion Matrix Heatmap
+# ==========================================================
+
+# Convert confusion matrix to dataframe
+conf_df <- as.data.frame(conf_matrix$table)
+
+# Plot
+confusion_plot <- ggplot(conf_df,
+                         aes(x = Prediction,
+                             y = Reference,
+                             fill = Freq)) +
+
+  geom_tile(color = "white") +
+
+  geom_text(aes(label = Freq),
+            size = 5,
+            fontface = "bold") +
+
+  scale_fill_gradient(
+    low = "white",
+    high = "steelblue"
+  ) +
+
+  labs(
+    title = "Confusion Matrix - Binary XGBoost (Healthy vs CRC)",
+    x = "Predicted Class",
+    y = "Actual Class",
+    fill = "Count"
+  ) +
+
+  theme_minimal(base_size = 14)
+
+confusion_plot
+```
+
+```{r}
+# ==========================================================
+# Save Confusion Matrix Plot
+# ==========================================================
+
+ggsave(
+  filename = file.path(
+    figures_dir,
+    "XGBoostBinary_ConfusionMatrix.png"
+  ),
+  plot = confusion_plot,
+  width = 7,
+  height = 6,
+  dpi = 300
+)
+
+cat("Confusion matrix plot saved successfully.\n")
+```
+
+# Overall Evaluation Metrics
+
+```{r}
+# ==========================================================
+# Overall Evaluation Metrics
+# ==========================================================
+
+evaluation_metrics <- data.frame(
+  Metric = c(
+    "Accuracy",
+    "Kappa",
+    "AccuracyLower",
+    "AccuracyUpper",
+    "AccuracyPValue",
+    "McNemarPValue"
+  ),
+  Value = c(
+    conf_matrix$overall["Accuracy"],
+    conf_matrix$overall["Kappa"],
+    conf_matrix$overall["AccuracyLower"],
+    conf_matrix$overall["AccuracyUpper"],
+    conf_matrix$overall["AccuracyPValue"],
+    conf_matrix$overall["McnemarPValue"]
+  )
+)
+
+evaluation_metrics
+
+write.csv(
+  evaluation_metrics,
+  file.path(
+    results_dir,
+    "XGBoostBinary_OverallMetrics.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("Evaluation metrics saved successfully.\n")
+```
+
+# Class-wise Metrics
+
+```{r}
+# ==========================================================
+# Class-wise Evaluation Metrics
+# ==========================================================
+
+class_metrics <- as.data.frame(conf_matrix$byClass)
+
+class_metrics$Metric <- rownames(class_metrics)
+
+rownames(class_metrics) <- NULL
+
+colnames(class_metrics)[1] <- "Value"
+
+class_metrics
+
+write.csv(
+  class_metrics,
+  file.path(
+    results_dir,
+    "XGBoostBinary_ClassMetrics.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("Class-wise metrics saved successfully.\n")
+```
+
+Because this is a two-class problem, `conf_matrix$byClass` returns a single named vector — Sensitivity, Specificity, Precision, Recall, F1, Prevalence, Detection Rate, Detection Prevalence, and Balanced Accuracy — computed with CRC as the positive class, rather than a per-class matrix as in the three-class notebook. Balanced Accuracy in particular is a useful complement to overall Accuracy here, since it averages Sensitivity and Specificity and is therefore insensitive to any residual imbalance between the Healthy and CRC sample counts.
+
+# Matthews Correlation Coefficient (MCC)
+
+```{r}
+# ==========================================================
+# Matthews Correlation Coefficient (MCC)
+# ==========================================================
+
+mcc_data <- data.frame(
+  truth = y_test,
+  prediction = binary_predictions
+)
+
+mcc_value <- yardstick::mcc(
+  mcc_data,
+  truth = truth,
+  estimate = prediction
+)
+
+mcc_value
+
+write.csv(
+  mcc_value,
+  file.path(
+    results_dir,
+    "XGBoostBinary_MCC.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("MCC saved successfully.\n")
+```
+
+The Matthews Correlation Coefficient is a balanced summary statistic that accounts for all four cells of the binary confusion matrix simultaneously. A value close to +1 indicates near-perfect classification, 0 indicates performance no better than random assignment, and negative values indicate systematic disagreement between predicted and actual labels.
+
+# ROC Curve
+
+```{r}
+# ==========================================================
+# ROC Curve
+# ==========================================================
+
+roc_binary <- roc(
+  response = y_test,
+  predictor = binary_probabilities,
+  levels = c("healthy", "CRC")
+)
+
+plot(
+  roc_binary,
+  col = "blue",
+  lwd = 2,
+  main = "ROC Curve - Binary XGBoost (Healthy vs CRC)"
+)
+
+abline(
+  a = 0,
+  b = 1,
+  lty = 2,
+  col = "red"
+)
+```
+
+# Save ROC Plot
+
+```{r}
+# ==========================================================
+# Save ROC Plot
+# ==========================================================
+
+png(
+  file.path(
+    figures_dir,
+    "XGBoostBinary_ROC.png"
+  ),
+  width = 900,
+  height = 700,
+  res = 150
+)
+
+plot(
+  roc_binary,
+  col = "blue",
+  lwd = 2,
+  main = "ROC Curve - Binary XGBoost (Healthy vs CRC)"
+)
+
+abline(
+  a = 0,
+  b = 1,
+  lty = 2,
+  col = "red"
+)
+
+dev.off()
+
+cat("ROC plot saved successfully.\n")
+```
+
+A single ROC curve is sufficient here, unlike the one-vs-rest curves required in the three-class notebook, because CRC vs Healthy is inherently a binary discrimination problem. A curve that bows tightly toward the top-left corner, with AUC close to 1, indicates strong separability of CRC from Healthy samples based on the microbial abundance profile.
+
+# AUC values
+
+```{r}
+# ==========================================================
+# Area Under the Curve (AUC)
+# ==========================================================
+
+auc_binary <- auc(roc_binary)
+
+auc_binary
+```
+
+```{r}
+# ==========================================================
+# Save AUC Values
+# ==========================================================
+
+auc_results <- data.frame(
+  AUC = as.numeric(auc_binary)
+)
+
+auc_results
+
+write.csv(
+  auc_results,
+  file.path(
+    results_dir,
+    "XGBoostBinary_AUC.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("AUC saved successfully.\n")
+```
+
+# ROC Coordinates
+
+```{r}
+# ==========================================================
+# ROC Coordinates
+# ==========================================================
+
+roc_coordinates <- data.frame(
+  Specificity = roc_binary$specificities,
+  Sensitivity = roc_binary$sensitivities,
+  Threshold = roc_binary$thresholds
+)
+
+write.csv(
+  roc_coordinates,
+  file.path(
+    results_dir,
+    "XGBoostBinary_ROC_Coordinates.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("ROC coordinates saved successfully.\n")
+```
+
+# Top Important Biomarkers
+
+```{r}
+# ==========================================================
+# Top Important Biomarkers
+# ==========================================================
+
+top_biomarkers <- head(var_imp_df_named, 20) %>%
+  mutate(
+    # Extract genus and species from full taxonomic string
+    Microbe = sub(".*g__", "", Feature),
+    Microbe = sub("\\|s__", " ", Microbe),
+    Microbe = sub("\\|.*", "", Microbe),
+    Microbe = gsub("_", " ", Microbe),
+    Microbe = gsub("^([A-Za-z]+)\\.\\1\\s+", "\\1 ", Microbe),
+    Microbe = gsub("\\.", " ", Microbe)
+  )
+
+# If extraction fails (no genus/species tag found), keep original
+top_biomarkers$Microbe[
+  is.na(top_biomarkers$Microbe) | top_biomarkers$Microbe == ""
+] <- top_biomarkers$Feature[
+  is.na(top_biomarkers$Microbe) | top_biomarkers$Microbe == ""
+]
+
+top_biomarkers
+
+write.csv(
+  top_biomarkers,
+  file.path(
+    results_dir,
+    "XGBoostBinary_TopBiomarkers.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("Top biomarkers table saved successfully.\n")
+```
+
+```{r}
+#===============================================================
+# Plot Top Biomarkers
+#===============================================================
+
+biomarker_plot <- ggplot(
+  top_biomarkers,
+  aes(
+    x = reorder(Microbe, Gain),
+    y = Gain,
+    fill = Gain
+  )
+) +
+  geom_col(width = 0.7) +
+  coord_flip() +
+  scale_fill_gradient(
+    low = "lightsteelblue",
+    high = "steelblue4"
+  ) +
+  labs(
+    title = "Top 20 Microbial Biomarkers - Binary XGBoost",
+    subtitle = "Ranked by XGBoost importance (Gain), Healthy vs CRC",
+    x = "Genus and Species",
+    y = "Gain"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, size = 9),
+    legend.position = "none"
+  )
+
+print(biomarker_plot)
+
+ggsave(
+  filename = file.path(
+    figures_dir,
+    "XGBoostBinary_TopBiomarkers.png"
+  ),
+  plot = biomarker_plot,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+cat("Top biomarkers plot saved successfully.\n")
+```
+
+These 20 taxa are considered important by the binary XGBoost model because splits on them, across all boosting rounds, consistently produced the largest average reduction in classification loss (Gain) when separating Healthy from CRC samples specifically. Because this importance is computed on the model actually used for prediction (unlike Boruta, which only decided feature inclusion beforehand), this ranking reflects each taxon's realized contribution to the final binary classifier and is the most direct candidate biomarker list produced by this notebook.
+
+# Biological Interpretation of the Binary Classification
+
+Restricting the comparison to Healthy vs CRC, and removing the intermediate Adenoma class, sharpens the classification task relative to the three-class notebook: the model no longer has to draw a decision boundary through the biologically ambiguous adenoma-to-carcinoma transition, and can instead focus purely on taxa that separate frank disease from a healthy gut microbiome. Taxa that rank highly here but were less prominent in the three-class XGBoost importance ranking are candidates whose association with CRC is diluted, in the multiclass setting, by Adenoma samples sharing intermediate abundance levels with both healthy and cancer states. Conversely, taxa that remain highly ranked in both the multiclass and binary analyses are stronger, more robust candidate biomarkers of colorectal cancer, since their discriminative signal persists regardless of whether Adenoma samples are included in training. The AUC obtained in this notebook (`r round(as.numeric(auc_binary), 3)`) provides a direct, binary-only benchmark of separability that is not achievable from a one-vs-rest curve computed on the three-class model, since one-vs-rest CRC curves are still influenced by the presence of Adenoma as a competing class during training.
+
+# Conclusion
+
+This exploratory notebook trained a binary XGBoost classifier restricted to Healthy and CRC samples, using the same near-zero variance filtering, Boruta feature selection, and scaling steps established across the rest of the project, but implemented model training against the native `xgboost` API — `xgb.DMatrix`, `xgb.cv()` with early stopping, and `xgb.train()` — rather than `caret::train(method = "xgbTree")`, in order to avoid the `NA` tuning results produced by the current caret/xgboost integration. On the held-out test set, the model achieved an accuracy of `r round(conf_matrix$overall["Accuracy"], 3)`, a Kappa of `r round(conf_matrix$overall["Kappa"], 3)`, and an AUC of `r round(as.numeric(auc_binary), 3)`, using `max_depth = ` `r best_params_row$max_depth`, `eta = ` `r best_params_row$eta`, and `r best_nrounds` boosting rounds, with `r length(selected_features)` microbial features surviving Boruta selection on the binary training data. As a secondary, exploratory analysis, this notebook does not replace the three-class XGBoost evaluation; instead it isolates the Healthy-vs-CRC signal to identify which candidate biomarkers are most robust to the removal of Adenoma as an intermediate disease state, and establishes a binary XGBoost benchmark directly comparable to the binary Logistic Regression and binary Random Forest baselines trained on the same two classes.
+
+# Session Information
+
+```{r}
+# ==========================================================
+# Session Information
+# ==========================================================
+
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(
+    reports_dir,
+    "XGBoostBinary_SessionInfo.txt"
+  )
+)
+
+sessionInfo()
+```
+
+## Session information
+
+The final section records the exact R session used for this knit. The same information is also saved as a text artifact so the HTML report and repository contain both a human-readable and machine-readable provenance record.
+
+```{r session-information}
+session_file <- file.path(
+  results_dir,
+  "session_info",
+  "04_Binary_XGBoost_CRC_vs_Healthy_sessionInfo.txt"
+)
+write_session_info(session_file)
+cat("Saved session information to:", session_file, "\n\n")
+sessionInfo()
+```

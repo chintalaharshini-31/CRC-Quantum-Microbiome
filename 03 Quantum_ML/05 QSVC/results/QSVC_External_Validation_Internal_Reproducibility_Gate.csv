@@ -1,0 +1,19 @@
+Model,Metric,Reconstructed,Saved,Absolute_Difference,Pass
+QSVC (8 features),Accuracy,0.5454545454545454,0.5454545454545454,0.0,True
+QSVC (8 features),Precision,0.5,0.5,0.0,True
+QSVC (8 features),Recall_Sensitivity,0.6,0.6,0.0,True
+QSVC (8 features),Specificity,0.5,0.5,0.0,True
+QSVC (8 features),F1_Score,0.5454545454545454,0.5454545454545454,0.0,True
+QSVC (8 features),ROC_AUC,0.6083333333333334,0.6083333333333334,0.0,True
+"Classical SVM (RBF, 8 features)",Accuracy,0.5909090909090909,0.5909090909090909,0.0,True
+"Classical SVM (RBF, 8 features)",Precision,0.5714285714285714,0.5714285714285714,0.0,True
+"Classical SVM (RBF, 8 features)",Recall_Sensitivity,0.4,0.4,0.0,True
+"Classical SVM (RBF, 8 features)",Specificity,0.75,0.75,0.0,True
+"Classical SVM (RBF, 8 features)",F1_Score,0.47058823529411764,0.4705882352941176,5.551115123125783e-17,True
+"Classical SVM (RBF, 8 features)",ROC_AUC,0.6,0.6,0.0,True
+Logistic Regression (8 features),Accuracy,0.6363636363636364,0.6363636363636364,0.0,True
+Logistic Regression (8 features),Precision,0.6666666666666666,0.6666666666666666,0.0,True
+Logistic Regression (8 features),Recall_Sensitivity,0.4,0.4,0.0,True
+Logistic Regression (8 features),Specificity,0.8333333333333334,0.8333333333333334,0.0,True
+Logistic Regression (8 features),F1_Score,0.5,0.5,0.0,True
+Logistic Regression (8 features),ROC_AUC,0.7083333333333334,0.7083333333333334,0.0,True

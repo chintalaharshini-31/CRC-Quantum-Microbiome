@@ -1,0 +1,2 @@
+"Dataset","N_Total","N_Healthy","N_CRC","N_Other_Condition_Excluded","Feature_Count_Per_Model","Feature_Overlap_Status","Available_Metadata_Fields"
+"VogtmannE_2016",104,52,52,6,20,"Complete (all 20 features matched for all 4 models)","study_name; subject_id; body_site; study_condition; disease; age; age_category; gender; country; non_westernized; sequencing_platform; DNA_extraction_kit; PMID; number_reads; number_bases; minimum_read_length; median_read_length; NCBI_accession; curator; BMI"

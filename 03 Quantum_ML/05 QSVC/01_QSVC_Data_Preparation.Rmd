@@ -1,0 +1,1078 @@
+---
+title: "creating_quantum"
+author: "Harshini"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    theme: cosmo
+    highlight: tango
+    df_print: paged
+    fig_caption: true
+    self_contained: true
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  collapse = TRUE,
+  comment = "##",
+  fig.width = 7.2,
+  fig.height = 5.2,
+  dpi = 300,
+  fig.align = "center",
+  out.width = "92%",
+  results = "markup"
+)
+
+options(width = 90, scipen = 999)
+source("../../R/project_setup.R")
+set.seed(1910)
+
+# Quantum notebook output locations. Existing validated artifacts are never overwritten
+# unless the analysis code explicitly writes to those same documented paths.
+results_dir <- file.path(quantum_dir, "results")
+models_dir <- file.path(quantum_dir, "models")
+data_dir <- file.path(quantum_dir, "data")
+figures_dir <- file.path(quantum_dir, "figures")
+for (d in c(results_dir, models_dir, data_dir, figures_dir)) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+
+```
+
+## Notebook roadmap
+
+**Purpose:** This notebook is one reproducible component of the CRC microbiome classification pipeline.
+
+**Execution order**
+1. Load the project environment and fixed random seed (`1910`).
+2. Load only the validated project artifacts required for this analysis.
+3. Perform the analysis exactly as documented below.
+4. Generate tables/figures and save machine-readable outputs.
+5. Record the session information used for the run.
+
+**Output contract:** generated tables, figures, model objects, audit files, and session information are written under `03 Quantum_ML/05 QSVC/results/`. The notebook itself renders to HTML with a floating table of contents, so the sections can be navigated from the left-hand panel in the knitted document.
+
+**Reproducibility rule:** this repository preserves the validated analysis logic and project-wide seed. Environment restoration is handled by `renv.lock` for R and `requirements.txt` for Python. The notebooks do not silently install unpinned packages during knitting.
+
+### Reproducibility constants
+
+- Project seed: **1910**
+- Discovery cohort: **ZellerG_2014**
+- Primary task: **Healthy vs CRC; adenoma excluded**
+- Frozen discovery split: **92 training / 22 held-out test samples**
+- Primary feature panel: **20 Boruta-selected features**
+- External cohorts: **FengQ_2015** and **VogtmannE_2016**
+
+```{r}
+# ==========================================================
+# QSVC DATA EXPORT
+# Run this in your R environment
+# ==========================================================
+
+# ==========================================================
+# 1. LOAD REQUIRED PACKAGES
+# ==========================================================
+
+library(curatedMetagenomicData)
+library(TreeSummarizedExperiment)
+library(SummarizedExperiment)
+library(caret)
+library(Boruta)
+library(dplyr)
+# ===========================================# ==========================================================
+# PROJECT PATHS
+# ==========================================================
+
+# Locate the repository root from the directory used for knitting.
+# This avoids hard-coded Windows paths and does not depend on
+# project_setup.R's internal path variables.
+
+find_project_root <- function(start_dir = getwd()) {
+
+  current <- normalizePath(
+    start_dir,
+    winslash = "/",
+    mustWork = TRUE
+  )
+
+  for (i in 0:10) {
+
+    has_classical <- dir.exists(
+      file.path(current, "02 Classical ML")
+    )
+
+    has_quantum <- dir.exists(
+      file.path(current, "03 Quantum_ML")
+    )
+
+    if (has_classical && has_quantum) {
+      return(current)
+    }
+
+    parent <- dirname(current)
+
+    if (identical(parent, current)) {
+      break
+    }
+
+    current <- parent
+  }
+
+  stop(
+    paste0(
+      "ERROR: Could not locate CRC project root from knitting directory.\n",
+      "Starting directory: ", normalizePath(start_dir, winslash = "/", mustWork = TRUE), "\n",
+      "Expected an ancestor containing both '02 Classical ML' and '03 Quantum_ML'."
+    )
+  )
+}
+
+project_dir <- find_project_root()
+
+# Classical ML folder
+classical_dir <- file.path(
+  project_dir,
+  "02 Classical ML"
+)
+
+# Classical ML subdirectories
+models_dir <- file.path(
+  classical_dir,
+  "models"
+)
+
+results_classical_dir <- file.path(
+  classical_dir,
+  "results"
+)
+
+figures_classical_dir <- file.path(
+  classical_dir,
+  "figures"
+)
+
+# QSVC folder
+qsvc_dir <- file.path(
+  project_dir,
+  "03 Quantum_ML",
+  "05 QSVC"
+)
+
+# QSVC data folder
+data_dir <- file.path(
+  qsvc_dir,
+  "data"
+)
+
+# Create QSVC data folder if needed
+dir.create(
+  data_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+# VERIFY PATHS
+# ==========================================================
+
+cat("Project directory:\n")
+print(project_dir)
+
+cat("\nClassical ML directory:\n")
+print(classical_dir)
+
+cat("\nModels directory:\n")
+print(models_dir)
+
+cat("\nQSVC directory:\n")
+print(qsvc_dir)
+
+cat("\nQSVC data directory:\n")
+print(data_dir)
+
+# ==========================================================
+# VERIFY SHARED TRAIN-TEST SPLIT
+# ==========================================================
+
+train_index_path <- file.path(
+  models_dir,
+  "BinaryClass_Train_Index.rds"
+)
+
+cat("\nFINAL SHARED SPLIT PATH:\n")
+print(train_index_path)
+cat("\nShared split exists: ")
+print(file.exists(train_index_path))
+
+cat("\nLooking for:\n")
+print(train_index_path)
+
+if (!file.exists(train_index_path)) {
+
+  stop(
+    paste0(
+      "\nERROR: Shared train-test split not found.\n\n",
+      "Expected location:\n",
+      train_index_path
+    )
+  )
+
+}
+
+cat(
+  "\nSUCCESS: BinaryClass_Train_Index.rds found.\n"
+)
+
+
+
+cat(
+  "\nShared BinaryClass_Train_Index.rds found successfully.\n"
+)
+
+# ==========================================================
+# 6. LOAD THE EXACT SHARED TRAIN-TEST SPLIT
+# ==========================================================
+
+train_index <- readRDS(train_index_path)
+
+cat("\nShared train-test split loaded successfully.\n")
+
+cat("\nNumber of training indices:\n")
+print(length(train_index))
+
+# ==========================================================
+# 7. LOAD THE ZELLER MICROBIOME DATASET
+# ==========================================================
+
+zeller <- curatedMetagenomicData(
+  "ZellerG_2014.relative_abundance",
+  dryrun = FALSE
+)[[1]]
+
+# ==========================================================
+# 8. EXTRACT ABUNDANCE MATRIX
+# ==========================================================
+
+abundance <- assay(zeller)
+
+# Original structure:
+# rows    = microbial features
+# columns = samples
+#
+# Transpose so:
+# rows    = samples
+# columns = microbial features
+
+X <- as.data.frame(
+  t(abundance)
+)
+
+# ==========================================================
+# 9. EXTRACT DISEASE LABELS
+# ==========================================================
+
+y <- colData(zeller)$study_condition
+
+# ==========================================================
+# 10. CREATE WORKING DATASET
+# ==========================================================
+
+crc_data <- X
+
+crc_data$disease <- y
+
+# ==========================================================
+# 11. CREATE THE FINAL BINARY DATASET
+# ==========================================================
+
+binary_data <- crc_data %>%
+  
+  mutate(
+    disease = case_match(
+      disease,
+      "control" ~ "healthy",
+      .default = disease
+    )
+  ) %>%
+  
+  filter(
+    disease %in% c(
+      "healthy",
+      "CRC"
+    )
+  )
+
+# ==========================================================
+# 12. SET THE EXACT CLASS ORDER
+# ==========================================================
+
+binary_data$disease <- factor(
+  binary_data$disease,
+  levels = c(
+    "healthy",
+    "CRC"
+  )
+)
+
+# ==========================================================
+# 13. VERIFY THE BINARY DATASET
+# ==========================================================
+
+cat("\nBinary dataset dimensions:\n")
+print(dim(binary_data))
+
+cat("\nBinary class counts:\n")
+print(table(binary_data$disease))
+
+# Expected:
+# healthy = 61
+# CRC     = 53
+# Total   = 114
+
+# ==========================================================
+# 14. VERIFY SHARED INDICES MATCH THIS DATASET
+# ==========================================================
+
+if (max(train_index) > nrow(binary_data)) {
+
+  stop(
+    paste0(
+      "\nERROR: The loaded train indices do not match ",
+      "the current binary dataset.\n",
+      "Maximum train index: ", max(train_index), "\n",
+      "Number of binary samples: ", nrow(binary_data)
+    )
+  )
+
+}
+
+# ==========================================================
+# 15. CREATE THE EXACT SHARED TRAIN-TEST SPLIT
+# ==========================================================
+
+train_data <- binary_data[
+  train_index,
+  ,
+  drop = FALSE
+]
+
+test_data <- binary_data[
+  -train_index,
+  ,
+  drop = FALSE
+]
+
+# ==========================================================
+# 16. VERIFY SPLIT DIMENSIONS
+# ==========================================================
+
+cat("\nTraining dataset dimensions:\n")
+print(dim(train_data))
+
+cat("\nTesting dataset dimensions:\n")
+print(dim(test_data))
+
+if (nrow(train_data) != 92) {
+
+  stop(
+    paste0(
+      "\nERROR: Expected 92 training samples but found ",
+      nrow(train_data)
+    )
+  )
+
+}
+
+if (nrow(test_data) != 22) {
+
+  stop(
+    paste0(
+      "\nERROR: Expected 22 testing samples but found ",
+      nrow(test_data)
+    )
+  )
+
+}
+
+cat(
+  "\nCorrect shared split confirmed:",
+  "\nTraining samples = 92",
+  "\nTesting samples  = 22\n"
+)
+
+# ==========================================================
+# 17. VERIFY CLASS DISTRIBUTION
+# ==========================================================
+
+cat("\nTraining class distribution:\n")
+print(table(train_data$disease))
+
+cat("\nTesting class distribution:\n")
+print(table(test_data$disease))
+
+cat("\nTraining class proportions:\n")
+print(prop.table(table(train_data$disease)))
+
+cat("\nTesting class proportions:\n")
+print(prop.table(table(test_data$disease)))
+
+# ==========================================================
+# 18. SEPARATE FEATURES AND LABELS
+# ==========================================================
+
+X_train_raw <- train_data %>%
+  select(-disease)
+
+X_test_raw <- test_data %>%
+  select(-disease)
+
+y_train <- train_data$disease
+
+y_test <- test_data$disease
+
+# ==========================================================
+# 19. NEAR-ZERO VARIANCE FILTERING
+# Training data only
+# ==========================================================
+
+nzv <- nearZeroVar(
+  X_train_raw
+)
+
+cat("\nNumber of NZV features removed:\n")
+print(length(nzv))
+
+if (length(nzv) > 0) {
+
+  X_train_nzv <- X_train_raw[
+    ,
+    -nzv,
+    drop = FALSE
+  ]
+
+  X_test_nzv <- X_test_raw[
+    ,
+    -nzv,
+    drop = FALSE
+  ]
+
+} else {
+
+  X_train_nzv <- X_train_raw
+
+  X_test_nzv <- X_test_raw
+
+}
+
+cat("\nFeatures remaining after NZV filtering:\n")
+print(ncol(X_train_nzv))
+
+# ==========================================================
+# 20. BORUTA FEATURE SELECTION
+# Training data only
+# ==========================================================
+
+set.seed(1910)
+
+boruta_data <- data.frame(
+  Disease = y_train,
+  X_train_nzv,
+  check.names = FALSE
+)
+
+boruta_model <- Boruta(
+  Disease ~ .,
+  data = boruta_data,
+  doTrace = 0
+)
+
+boruta_final <- TentativeRoughFix(
+  boruta_model
+)
+
+selected_features <- getSelectedAttributes(
+  boruta_final,
+  withTentative = FALSE
+)
+
+# ==========================================================
+# Rank the 20 Boruta-confirmed features by Boruta importance
+# ==========================================================
+
+library(tibble)
+
+boruta_stats <- attStats(boruta_final) %>%
+  as.data.frame() %>%
+  rownames_to_column("Original") %>%
+  filter(
+    Original %in% selected_features,
+    decision == "Confirmed"
+  ) %>%
+  arrange(desc(meanImp))
+
+# Verify that all 20 selected features are present
+stopifnot(nrow(boruta_stats) == 20)
+
+# Keep the top 8 features for the QSVC
+top8_boruta <- boruta_stats %>%
+  slice_head(n = 8) %>%
+  mutate(Rank = row_number()) %>%
+  select(
+    Rank,
+    Original,
+    meanImp,
+    medianImp,
+    minImp,
+    normHits,
+    decision
+  )
+
+print(top8_boruta)
+# ==========================================================
+# 21. VERIFY EXACTLY 20 FEATURES WERE SELECTED
+# ==========================================================
+
+cat("\nNumber of Boruta-selected features:\n")
+print(length(selected_features))
+
+if (length(selected_features) != 20) {
+
+  stop(
+    paste0(
+      "\nERROR: Expected exactly 20 Boruta-selected features, ",
+      "but found ",
+      length(selected_features),
+      ".\n",
+      "Do not continue because this would break consistency ",
+      "with the final classical pipeline."
+    )
+  )
+
+}
+
+cat(
+  "\nExactly 20 Boruta-selected features confirmed.\n"
+)
+
+# ==========================================================
+# 22. DISPLAY THE SELECTED FEATURES
+# ==========================================================
+
+cat("\nSelected features:\n")
+
+print(
+  selected_features
+)
+
+# ==========================================================
+# 23. SUBSET TRAINING DATA
+# ==========================================================
+
+X_train_boruta <- X_train_nzv[
+  ,
+  selected_features,
+  drop = FALSE
+]
+
+# ==========================================================
+# 24. SUBSET TESTING DATA
+# Using the exact same training-selected features
+# ==========================================================
+
+X_test_boruta <- X_test_nzv[
+  ,
+  selected_features,
+  drop = FALSE
+]
+
+# ==========================================================
+# 25. VERIFY FEATURE CONSISTENCY
+# ==========================================================
+
+if (!identical(
+  colnames(X_train_boruta),
+  colnames(X_test_boruta)
+)) {
+
+  stop(
+    "\nERROR: Training and testing feature names/order do not match."
+  )
+
+}
+
+cat(
+  "\nTraining and testing feature order confirmed identical.\n"
+)
+
+# ==========================================================
+# 26. CENTER AND SCALE
+# Fit on training data only
+# ==========================================================
+
+scaler <- preProcess(
+  X_train_boruta,
+  method = c(
+    "center",
+    "scale"
+  )
+)
+
+# ==========================================================
+# 27. TRANSFORM TRAINING DATA
+# ==========================================================
+
+X_train_scaled <- predict(
+  scaler,
+  X_train_boruta
+)
+
+# ==========================================================
+# 28. TRANSFORM TEST DATA
+# Using the training-fitted scaler
+# ==========================================================
+
+X_test_scaled <- predict(
+  scaler,
+  X_test_boruta
+)
+
+cat(
+  "\nTraining and testing data scaled successfully.\n"
+)
+
+# ==========================================================
+# 29. CREATE FEATURE NAME MAP
+# ==========================================================
+
+feature_name_map <- data.frame(
+  
+  Original = colnames(X_train_scaled),
+  
+  Syntactic = make.names(
+    colnames(X_train_scaled),
+    unique = TRUE
+  ),
+  
+  stringsAsFactors = FALSE
+  
+)
+
+# ==========================================================
+# Match Boruta-ranked features to their Python-safe names
+# ==========================================================
+
+top8_export <- top8_boruta %>%
+  left_join(
+    feature_name_map,
+    by = "Original"
+  ) %>%
+  select(
+    Rank,
+    Original,
+    Syntactic,
+    meanImp,
+    medianImp,
+    minImp,
+    normHits,
+    decision
+  )
+
+# Verify every top-8 feature was successfully mapped
+stopifnot(nrow(top8_export) == 8)
+stopifnot(!anyNA(top8_export$Syntactic))
+
+print(top8_export)
+
+# ==========================================================
+# 30. APPLY PYTHON-SAFE FEATURE NAMES
+# ==========================================================
+
+colnames(X_train_scaled) <- feature_name_map$Syntactic
+
+colnames(X_test_scaled) <- feature_name_map$Syntactic
+
+# ==========================================================
+# 31. VERIFY FINAL FEATURE ORDER
+# ==========================================================
+
+if (!identical(
+  colnames(X_train_scaled),
+  colnames(X_test_scaled)
+)) {
+
+  stop(
+    "\nERROR: Final training and testing feature order does not match."
+  )
+
+}
+
+cat(
+  "\nFinal feature names and order confirmed identical.\n"
+)
+
+# ==========================================================
+# 32. PRESERVE ORIGINAL SAMPLE IDS
+# ==========================================================
+
+train_sample_ids <- rownames(
+  X_train_scaled
+)
+
+test_sample_ids <- rownames(
+  X_test_scaled
+)
+
+# ==========================================================
+# 33. CHECK FOR TRAIN-TEST SAMPLE OVERLAP
+# ==========================================================
+
+overlap_ids <- intersect(
+  train_sample_ids,
+  test_sample_ids
+)
+
+if (length(overlap_ids) > 0) {
+
+  stop(
+    "\nERROR: Sample IDs overlap between training and testing data."
+  )
+
+}
+
+cat(
+  "\nNo training/testing sample overlap detected.\n"
+)
+
+# ==========================================================
+# 34. CREATE TRAINING EXPORT DATAFRAME
+# ==========================================================
+
+train_export <- data.frame(
+  
+  SampleID = train_sample_ids,
+  
+  X_train_scaled,
+  
+  disease = y_train,
+  
+  check.names = FALSE
+  
+)
+
+# ==========================================================
+# 35. CREATE TESTING EXPORT DATAFRAME
+# ==========================================================
+
+test_export <- data.frame(
+  
+  SampleID = test_sample_ids,
+  
+  X_test_scaled,
+  
+  disease = y_test,
+  
+  check.names = FALSE
+  
+)
+
+# ==========================================================
+# 36. VERIFY FINAL EXPORT DIMENSIONS
+# ==========================================================
+
+cat("\nTraining export dimensions:\n")
+print(dim(train_export))
+
+cat("\nTesting export dimensions:\n")
+print(dim(test_export))
+
+# Expected:
+# 92 rows × 22 columns
+# = SampleID + 20 features + disease
+#
+# 22 rows × 22 columns
+# = SampleID + 20 features + disease
+
+if (nrow(train_export) != 92) {
+  stop("\nERROR: Training export does not contain 92 samples.")
+}
+
+if (nrow(test_export) != 22) {
+  stop("\nERROR: Testing export does not contain 22 samples.")
+}
+
+if (ncol(train_export) != 22) {
+  stop(
+    paste0(
+      "\nERROR: Expected 22 columns in training export ",
+      "(SampleID + 20 features + disease), but found ",
+      ncol(train_export)
+    )
+  )
+}
+
+if (ncol(test_export) != 22) {
+  stop(
+    paste0(
+      "\nERROR: Expected 22 columns in testing export ",
+      "(SampleID + 20 features + disease), but found ",
+      ncol(test_export)
+    )
+  )
+}
+
+# ==========================================================
+# 37. EXPORT TRAINING DATA
+# ==========================================================
+
+train_export_path <- file.path(
+  data_dir,
+  "QSVC_Train_Data.csv"
+)
+
+write.csv(
+  train_export,
+  train_export_path,
+  row.names = FALSE
+)
+
+# ==========================================================
+# 38. EXPORT TESTING DATA
+# ==========================================================
+
+test_export_path <- file.path(
+  data_dir,
+  "QSVC_Test_Data.csv"
+)
+
+write.csv(
+  test_export,
+  test_export_path,
+  row.names = FALSE
+)
+
+# ==========================================================
+# 39. EXPORT FEATURE NAME MAP
+# ==========================================================
+
+feature_map_path <- file.path(
+  data_dir,
+  "QSVC_Feature_Name_Map.csv"
+)
+
+write.csv(
+  feature_name_map,
+  feature_map_path,
+  row.names = FALSE
+)
+
+# ==========================================================
+# 40. EXPORT TOP 8 FEATURES USED FOR QSVC
+# ==========================================================
+
+write.csv(
+  top8_export,
+  file.path(data_dir, "QSVC_Top8_Features.csv"),
+  row.names = FALSE
+)
+
+# ==========================================================
+# 41. CREATE EXPORT LOG
+# ==========================================================
+
+log_path <- file.path(
+  data_dir,
+  "QSVC_Export_Log.txt"
+)
+
+log_lines <- c(
+
+  "==========================================================",
+  "QSVC DATA EXPORT LOG",
+  "==========================================================",
+  
+  paste(
+    "Export date:",
+    format(Sys.time())
+  ),
+  
+  paste(
+    "Random seed:",
+    1910
+  ),
+  
+  "",
+  
+  "CLASSIFICATION TASK",
+  "Healthy vs CRC",
+  
+  "",
+  
+  "DATASET",
+  "ZellerG_2014.relative_abundance",
+  
+  "",
+  
+  "SHARED TRAIN-TEST SPLIT",
+  paste(
+    "Split file:",
+    train_index_path
+  ),
+  
+  paste(
+    "Training samples:",
+    nrow(train_export)
+  ),
+  
+  paste(
+    "Testing samples:",
+    nrow(test_export)
+  ),
+  
+  "",
+  
+  "FEATURE SELECTION",
+  
+  paste(
+    "NZV features removed:",
+    length(nzv)
+  ),
+  
+  paste(
+    "Final Boruta-selected features:",
+    length(selected_features)
+  ),
+  
+  "",
+  
+  "TRAINING CLASS COUNTS",
+  
+  paste(
+    names(table(y_train)),
+    table(y_train),
+    sep = " = ",
+    collapse = ", "
+  ),
+  
+  "",
+  
+  "TESTING CLASS COUNTS",
+  
+  paste(
+    names(table(y_test)),
+    table(y_test),
+    sep = " = ",
+    collapse = ", "
+  ),
+  
+  "",
+  
+  "OUTPUT FILES",
+  
+  train_export_path,
+  test_export_path,
+  feature_map_path
+  
+)
+
+writeLines(
+  log_lines,
+  log_path
+)
+
+# ==========================================================
+# 41. FINAL VERIFICATION
+# ==========================================================
+
+cat(
+  "\n==========================================================\n"
+)
+
+cat(
+  "QSVC DATA EXPORT COMPLETED SUCCESSFULLY\n"
+)
+
+cat(
+  "==========================================================\n"
+)
+
+cat(
+  "\nOutput directory:\n",
+  data_dir,
+  "\n"
+)
+
+cat(
+  "\nFiles created:\n"
+)
+
+cat(
+  "\n1. ",
+  train_export_path
+)
+
+cat(
+  "\n2. ",
+  test_export_path
+)
+
+cat(
+  "\n3. ",
+  feature_map_path
+)
+
+cat(
+  "\n4. ",
+  log_path
+)
+
+cat(
+  "\n\nFinal summary:\n"
+)
+
+cat(
+  "Training samples: ",
+  nrow(train_export),
+  "\n"
+)
+
+cat(
+  "Testing samples: ",
+  nrow(test_export),
+  "\n"
+)
+
+cat(
+  "Final features: ",
+  length(selected_features),
+  "\n"
+)
+
+cat(
+  "Seed: 1910\n"
+)
+
+cat(
+  "\nReady for Python QSVC analysis.\n"
+)
+```
+
+## Session information
+
+The final section records the exact R session used for this knit. The same information is also saved as a text artifact so the HTML report and repository contain both a human-readable and machine-readable provenance record.
+
+```{r session-information}
+session_file <- file.path(
+  results_dir,
+  "session_info",
+  "01_QSVC_Data_Preparation_sessionInfo.txt"
+)
+write_session_info(session_file)
+cat("Saved session information to:", session_file, "\n\n")
+sessionInfo()
+```

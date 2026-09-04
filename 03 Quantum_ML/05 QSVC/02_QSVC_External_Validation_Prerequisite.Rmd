@@ -1,0 +1,384 @@
+---
+title: "QSVC External Validation Prerequisite Export"
+author: "Harshini"
+date: "2026-08-25"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  collapse = TRUE,
+  comment = "##",
+  fig.width = 7.2,
+  fig.height = 5.2,
+  dpi = 300,
+  fig.align = "center",
+  out.width = "92%",
+  results = "markup"
+)
+```
+
+# Purpose
+
+This R Markdown file prepares the two independent external cohorts for the **existing discovery-trained QSVC pipeline**.
+
+It must **not** perform feature selection, refit the discovery scaler, retrain any model, or modify the existing QSVC notebook.
+
+The frozen discovery artifacts are:
+
+- `02 Classical ML/results/Binary_Selected_20_Features.csv`
+- `02 Classical ML/models/Scaler.rds`
+- `03 Quantum_ML/05 QSVC/data/QSVC_Feature_Name_Map.csv`
+
+The resulting external CSV files are written only to:
+
+`03 Quantum_ML/05 QSVC/data/`
+
+The exported external matrices contain the same 20 discovery-selected microbial features, after applying the frozen discovery center/scale transformation. Python then applies the already-fitted 8-feature quantum angle scaler.
+
+```{r packages}
+# ==========================================================
+# 1. Packages
+# ==========================================================
+
+library(curatedMetagenomicData)
+library(TreeSummarizedExperiment)
+library(SummarizedExperiment)
+library(caret)
+library(dplyr)
+library(tibble)
+
+set.seed(1910)
+```
+
+```{r paths}
+# ==========================================================
+# 2. Project paths
+# ==========================================================
+
+# This Rmd lives in: project_root/03 Quantum_ML/05 QSVC/
+# Knit uses the Rmd directory as the working directory, so go up
+# two levels to recover the repository root.
+project_dir <- normalizePath(
+  file.path(getwd(), "../.."),
+  winslash = "/",
+  mustWork = TRUE
+)
+
+# Guard against accidentally knitting from the wrong directory.
+if (!dir.exists(file.path(project_dir, "02 Classical ML")) ||
+    !dir.exists(file.path(project_dir, "03 Quantum_ML"))) {
+  stop(
+    "Could not identify the CRC project root from the QSVC notebook location.
+",
+    "Expected both '02 Classical ML' and '03 Quantum_ML' under: ",
+    project_dir
+  )
+}
+
+classical_dir <- file.path(project_dir, "02 Classical ML")
+qsvc_dir <- file.path(project_dir, "03 Quantum_ML", "05 QSVC")
+
+models_dir <- file.path(classical_dir, "models")
+classical_results_dir <- file.path(classical_dir, "results")
+qsvc_data_dir <- file.path(qsvc_dir, "data")
+
+dir.create(qsvc_data_dir, recursive = TRUE, showWarnings = FALSE)
+
+cat("Project:", project_dir, "\n")
+cat("QSVC data directory:", qsvc_data_dir, "\n")
+```
+
+```{r frozen-artifact-check}
+# ==========================================================
+# 3. Verify frozen discovery artifacts
+# ==========================================================
+
+features_path <- file.path(
+  classical_results_dir,
+  "Binary_Selected_20_Features.csv"
+)
+
+scaler_path <- file.path(
+  models_dir,
+  "Scaler.rds"
+)
+
+qsvc_feature_map_path <- file.path(
+  qsvc_data_dir,
+  "QSVC_Feature_Name_Map.csv"
+)
+
+required_files <- c(
+  features_path,
+  scaler_path,
+  qsvc_feature_map_path
+)
+
+cat("\nFrozen artifact paths being checked:\n")
+cat("Features :", features_path, "\n")
+cat("Scaler   :", scaler_path, "\n")
+cat("Feature map:", qsvc_feature_map_path, "\n\n")
+
+missing_files <- required_files[!file.exists(required_files)]
+
+if (length(missing_files) > 0) {
+  stop(
+    "Required frozen discovery artifact(s) missing:\n",
+    paste(missing_files, collapse = "\n")
+  )
+}
+
+selected_20 <- read.csv(
+  features_path,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)$Feature
+
+scaler <- readRDS(scaler_path)
+
+qsvc_map <- read.csv(
+  qsvc_feature_map_path,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+stopifnot(length(selected_20) == 20)
+stopifnot(all(selected_20 %in% qsvc_map$Original))
+
+cat("Frozen 20-feature panel verified.\n")
+cat("Frozen scaler verified.\n")
+cat("QSVC feature-name map verified.\n")
+```
+
+```{r export-function}
+# ==========================================================
+# 4. External-cohort export function
+# ==========================================================
+
+export_external_cohort <- function(
+  cohort_name,
+  output_filename
+) {
+
+  cat("\n====================================================\n")
+  cat("Processing:", cohort_name, "\n")
+  cat("====================================================\n")
+
+  cmd_obj <- curatedMetagenomicData(
+    paste0(cohort_name, ".relative_abundance"),
+    dryrun = FALSE
+  )[[1]]
+
+  abundance <- assay(cmd_obj)
+  X_raw <- as.data.frame(t(abundance), check.names = FALSE)
+
+  disease_raw <- colData(cmd_obj)$study_condition
+  sample_ids <- colnames(cmd_obj)
+
+  raw_df <- X_raw
+  raw_df$SampleID <- sample_ids
+  raw_df$disease_raw <- as.character(disease_raw)
+
+  raw_df$disease <- dplyr::case_match(
+    raw_df$disease_raw,
+    "control" ~ "healthy",
+    .default = raw_df$disease_raw
+  )
+
+  # Binary Healthy-vs-CRC task only.
+  binary_df <- raw_df %>%
+    filter(disease %in% c("healthy", "CRC"))
+
+  binary_df$disease <- factor(
+    binary_df$disease,
+    levels = c("healthy", "CRC")
+  )
+
+  # Require unique sample IDs.
+  if (anyDuplicated(binary_df$SampleID) > 0) {
+    stop("Duplicate sample IDs detected in ", cohort_name)
+  }
+
+  # Require all frozen discovery features.
+  missing_features <- setdiff(
+    selected_20,
+    colnames(binary_df)
+  )
+
+  if (length(missing_features) > 0) {
+    stop(
+      cohort_name,
+      " is missing one or more frozen discovery features:\n",
+      paste(missing_features, collapse = "\n")
+    )
+  }
+
+  X_ext <- binary_df[, selected_20, drop = FALSE]
+
+  # Apply the discovery-trained scaler only.
+  X_ext_scaled <- predict(
+    scaler,
+    X_ext
+  )
+
+  # Convert to the exact syntactic names used by QSVC_Train_Data.csv.
+  syntactic_names <- qsvc_map$Syntactic[
+    match(
+      colnames(X_ext_scaled),
+      qsvc_map$Original
+    )
+  ]
+
+  if (anyNA(syntactic_names)) {
+    stop(
+      "Failed to map one or more frozen features to QSVC syntactic names in ",
+      cohort_name
+    )
+  }
+
+  colnames(X_ext_scaled) <- syntactic_names
+
+  # Preserve the feature order exactly.
+  if (!identical(
+    colnames(X_ext_scaled),
+    qsvc_map$Syntactic[match(selected_20, qsvc_map$Original)]
+  )) {
+    stop(
+      "External feature order does not match the frozen QSVC feature order in ",
+      cohort_name
+    )
+  }
+
+  export_df <- data.frame(
+    SampleID = binary_df$SampleID,
+    X_ext_scaled,
+    disease = as.character(binary_df$disease),
+    check.names = FALSE
+  )
+
+  # Structural checks.
+  stopifnot(nrow(export_df) > 0)
+  stopifnot(ncol(export_df) == 22)
+  stopifnot(length(setdiff(c("healthy", "CRC"), unique(export_df$disease))) == 0)
+  # Check missing values on the scaled feature matrix itself.
+# At this point the feature columns have been renamed to the
+# exact QSVC syntactic names, so selected_20 (the original names)
+# must not be used to index export_df here.
+stopifnot(!anyNA(X_ext_scaled))
+
+  output_path <- file.path(
+    qsvc_data_dir,
+    output_filename
+  )
+
+ write.csv(
+  export_df,
+  output_path,
+  row.names = FALSE
+)
+
+  summary <- data.frame(
+    Cohort = cohort_name,
+    N_Total = nrow(export_df),
+    N_Healthy = sum(export_df$disease == "healthy"),
+    N_CRC = sum(export_df$disease == "CRC"),
+    Feature_Count = 20,
+    Scaler = "Frozen Zeller discovery Scaler.rds",
+    Feature_Source = "Frozen Binary_Selected_20_Features.csv",
+    Output_File = output_path,
+    stringsAsFactors = FALSE
+  )
+
+  summary
+}
+```
+
+```{r export-fengq}
+# ==========================================================
+# 5. Export FengQ_2015
+# ==========================================================
+
+fengq_summary <- export_external_cohort(
+  cohort_name = "FengQ_2015",
+  output_filename = "QSVC_External_FengQ_2015_Data.csv"
+)
+
+fengq_summary
+```
+
+```{r export-vogtmann}
+# ==========================================================
+# 6. Export VogtmannE_2016
+# ==========================================================
+
+vogtmann_summary <- export_external_cohort(
+  cohort_name = "VogtmannE_2016",
+  output_filename = "QSVC_External_VogtmannE_2016_Data.csv"
+)
+
+vogtmann_summary
+```
+
+```{r combined-summary}
+# ==========================================================
+# 7. Combined summary and export log
+# ==========================================================
+
+external_summary <- rbind(
+  fengq_summary,
+  vogtmann_summary
+)
+
+summary_path <- file.path(
+  qsvc_data_dir,
+  "QSVC_External_Validation_Cohort_Summary.csv"
+)
+
+write.csv(
+  external_summary,
+  summary_path,
+  row.names = FALSE
+)
+
+log_lines <- c(
+  "QSVC EXTERNAL VALIDATION PREREQUISITE EXPORT",
+  "=============================================",
+  paste("Export date:", format(Sys.time())),
+  paste("Random seed:", 1910),
+  "",
+  "FROZEN DISCOVERY ARTIFACTS",
+  features_path,
+  scaler_path,
+  qsvc_feature_map_path,
+  "",
+  "EXTERNAL OUTPUTS",
+  file.path(qsvc_data_dir, "QSVC_External_FengQ_2015_Data.csv"),
+  file.path(qsvc_data_dir, "QSVC_External_VogtmannE_2016_Data.csv"),
+  summary_path,
+  "",
+  "IMPORTANT",
+  "No external feature selection was performed.",
+  "No external scaler was fitted.",
+  "No model was retrained.",
+  "The exported features are the frozen discovery 20-feature panel",
+  "after applying the frozen discovery-trained center/scale transformation."
+)
+
+writeLines(
+  log_lines,
+  file.path(
+    qsvc_data_dir,
+    "QSVC_External_Validation_Prerequisite_Log.txt"
+  )
+)
+
+print(external_summary)
+cat("\nPrerequisite export completed successfully.\n")
+cat("Outputs written to:\n", qsvc_data_dir, "\n")
+```

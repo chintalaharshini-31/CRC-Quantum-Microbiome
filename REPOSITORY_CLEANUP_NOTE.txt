@@ -1,0 +1,13 @@
+CLEANUP APPLIED TO THIS GIT-READY SNAPSHOT
+
+No scientific analysis calculations were modified.
+
+Administrative/repository-only cleanup:
+- removed the old nested .git history;
+- removed RStudio local state (.Rproj.user) and .Rhistory;
+- excluded the installed renv library and renv staging area (both are already ignored by .gitignore);
+- removed the clearly duplicated 02 Classical ML/scripts/02 Classical ML/ results folder;
+- moved 12_Model_Comparison_sessionInfo.txt into the canonical 02 Classical ML/results/session_info/ directory;
+- removed stale LASSO summary artifacts that are not produced by the current LASSO Rmd;
+- renamed the already-knitted QSVC Rmd/HTML files from temporary FIXED/FINAL suffixes to their canonical notebook names;
+- kept the current knitted HTML files, model objects, CSVs, predictions, ROC data, figures, and session/provenance artifacts intact.

@@ -1,0 +1,25 @@
+PROJECT: Colorectal Cancer Microbiome Classification
+TASK: Binary Classification (Healthy vs CRC)
+
+REPRODUCIBILITY
+Random seed: 1910
+Train-test split: Stratified 80:20 split
+Shared train index file: BinaryClass_Train_Index.rds
+
+DATASET
+Training and testing sample counts are reported in the individual model notebooks.
+
+PREPROCESSING
+Near-zero variance removal performed using training data only
+Boruta feature selection performed using training data only
+Centering and scaling fitted on training data only
+
+CLASSICAL MODELS
+1. Binomial Logistic Regression
+2. Random Forest
+3. Support Vector Machine (RBF kernel)
+4. XGBoost
+
+CROSS-VALIDATION
+Repeated 10-fold cross-validation with 5 repeats
+Shared resampling structure used across classical model notebooks

@@ -1,0 +1,1107 @@
+---
+title: "XGBoost Forensic Audit"
+subtitle: "Independent audit of the original 48-configuration CV result"
+author: "Harshini Chintala"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    theme: cosmo
+    highlight: tango
+    df_print: paged
+    fig_caption: true
+    self_contained: true
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  collapse = TRUE,
+  comment = "##",
+  fig.width = 7.2,
+  fig.height = 5.2,
+  dpi = 300,
+  fig.align = "center",
+  out.width = "92%",
+  results = "markup"
+)
+
+options(width = 90, scipen = 999)
+source("../../R/project_setup.R")
+set.seed(1910)
+
+# Classical notebook output locations.
+project_dir <- classical_dir
+results_dir <- file.path(classical_dir, "results")
+models_dir <- file.path(classical_dir, "models")
+data_dir <- file.path(classical_dir, "data")
+reports_dir <- file.path(classical_dir, "reports")
+figures_dir <- file.path(classical_dir, "figures")
+for (d in c(results_dir, models_dir, data_dir, reports_dir, figures_dir)) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+
+# XGBoost forensic-audit output locations and execution controls.
+audit_root <- file.path(
+  results_dir,
+  "XGBoost_Forensic_Audit"
+)
+
+dir.create(
+  audit_root,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+checkpoint_path <- file.path(
+  audit_root,
+  "XGBoost_Manual_Rerun_Checkpoint.csv"
+)
+
+# TRUE = run/resume the complete independent 48-configuration audit.
+# FALSE = only read an existing checkpoint and skip the expensive rerun.
+RUN_FULL_MANUAL_RERUN <- TRUE
+
+#load packages
+library(dplyr)
+library(pROC)
+library(xgboost)
+library(caret)
+library(curatedMetagenomicData)
+library(TreeSummarizedExperiment)
+
+```
+
+## Notebook roadmap
+
+**Purpose:** This notebook is one reproducible component of the CRC microbiome classification pipeline.
+
+**Execution order**
+1. Load the project environment and fixed random seed (`1910`).
+2. Load only the validated project artifacts required for this analysis.
+3. Perform the analysis exactly as documented below.
+4. Generate tables/figures and save machine-readable outputs.
+5. Record the session information used for the run.
+
+**Output contract:** generated tables, figures, model objects, audit files, and session information are written under `02 Classical ML/results/`. The notebook itself renders to HTML with a floating table of contents, so the sections can be navigated from the left-hand panel in the knitted document.
+
+**Reproducibility rule:** this repository preserves the validated analysis logic and project-wide seed. Environment restoration is handled by `renv.lock` for R and `requirements.txt` for Python. The notebooks do not silently install unpinned packages during knitting.
+
+### Reproducibility constants
+
+- Project seed: **1910**
+- Discovery cohort: **ZellerG_2014**
+- Primary task: **Healthy vs CRC; adenoma excluded**
+- Frozen discovery split: **92 training / 22 held-out test samples**
+- Primary feature panel: **20 Boruta-selected features**
+- External cohorts: **FengQ_2015** and **VogtmannE_2016**
+
+# Purpose
+
+This notebook audits the original binary XGBoost cross-validation result that
+reported **CV AUC = 1.00 for all 48 hyperparameter configurations**.
+
+The audit does not modify the primary model, feature set, train/test split,
+or external-validation results.
+
+It performs two levels of checking:
+
+1. **Forensic integrity checks** on the saved fold definitions, labels,
+   parameter grid, result table, sample IDs, and preprocessing artifacts.
+2. **Independent manual out-of-fold reruns** using the saved hyperparameters
+   and saved best boosting round for each configuration. For every
+   configuration, each of the 50 held-out folds is predicted independently,
+   fold-level ROC AUC is calculated with `pROC`, and both the mean fold AUC and
+   pooled out-of-fold AUC are recorded.
+
+This manual rerun is deliberately independent of `xgb.cv()`'s
+`evaluation_log$test_auc_mean` extraction. The purpose is to determine whether
+the originally reported perfect CV result is reproduced by an independent
+fold-wise calculation.
+
+# Configuration
+
+
+
+# Load Saved Primary XGBoost Artifacts
+
+```{r artifacts}
+required_files <- c(
+  train_index = file.path(
+    models_dir,
+    "BinaryClass_Train_Index.rds"
+  ),
+  cv_folds = file.path(
+    models_dir,
+    "BinaryClass_CV_Folds.rds"
+  ),
+  scaler = file.path(
+    models_dir,
+    "Scaler_Binary_XGB.rds"
+  ),
+  selected_features = file.path(
+    results_dir,
+    "XGBoostBinary_Selected_Features.csv"
+  ),
+  tuning_results = file.path(
+    results_dir,
+    "XGBoostBinary_CV_TuningResults.csv"
+  ),
+  final_params = file.path(
+    models_dir,
+    "XGBoostBinary_Model_Params.rds"
+  )
+)
+
+artifact_status <- data.frame(
+  Artifact = names(required_files),
+  Path = unname(required_files),
+  Exists = file.exists(required_files)
+)
+
+print(artifact_status)
+
+if (any(!artifact_status$Exists)) {
+  stop("One or more required XGBoost audit artifacts are missing.")
+}
+
+train_index <- readRDS(
+  required_files["train_index"]
+)
+
+cv_folds <- readRDS(
+  required_files["cv_folds"]
+)
+
+scaler <- readRDS(
+  required_files["scaler"]
+)
+
+selected_features <- read.csv(
+  required_files["selected_features"],
+  stringsAsFactors = FALSE
+)$Feature
+
+saved_tuning <- read.csv(
+  required_files["tuning_results"],
+  stringsAsFactors = FALSE
+)
+
+saved_final_params <- readRDS(
+  required_files["final_params"]
+)
+
+stopifnot(length(train_index) == 92)
+stopifnot(length(cv_folds) == 50)
+stopifnot(length(selected_features) == 20)
+stopifnot(nrow(saved_tuning) == 48)
+
+cat("Saved XGBoost tuning configurations:", nrow(saved_tuning), "\n")
+cat("Saved CV folds:", length(cv_folds), "\n")
+```
+
+# Reconstruct the Exact Discovery Training Representation
+
+```{r reconstruct-data}
+zeller <- curatedMetagenomicData(
+  "ZellerG_2014.relative_abundance",
+  dryrun = FALSE
+)[[1]]
+
+abundance <- assay(zeller)
+
+X_full <- as.data.frame(
+  t(abundance),
+  check.names = FALSE
+)
+
+y_full <- as.character(
+  colData(zeller)$study_condition
+)
+
+discovery <- X_full
+
+discovery$disease <- dplyr::case_when(
+  y_full == "control" ~ "healthy",
+  y_full == "CRC" ~ "CRC",
+  TRUE ~ NA_character_
+)
+
+discovery <- discovery %>%
+  filter(!is.na(disease))
+
+discovery$disease <- factor(
+  discovery$disease,
+  levels = c("healthy", "CRC")
+)
+
+train_data <- discovery[train_index, , drop = FALSE]
+test_data <- discovery[-train_index, , drop = FALSE]
+
+y_train <- factor(
+  train_data$disease,
+  levels = c("healthy", "CRC")
+)
+
+y_test <- factor(
+  test_data$disease,
+  levels = c("healthy", "CRC")
+)
+
+X_train_raw <- train_data[
+  ,
+  setdiff(colnames(train_data), "disease"),
+  drop = FALSE
+]
+
+# The saved Boruta panel is already a subset of the post-NZV feature space.
+# Reconstruct the exact 20-feature training matrix and apply the saved scaler.
+stopifnot(
+  all(selected_features %in% colnames(X_train_raw))
+)
+
+X_train_selected <- X_train_raw[
+  ,
+  selected_features,
+  drop = FALSE
+]
+
+X_train_scaled <- predict(
+  scaler,
+  X_train_selected
+)
+
+colnames(X_train_scaled) <- make.names(
+  colnames(X_train_scaled),
+  unique = TRUE
+)
+
+stopifnot(
+  nrow(X_train_scaled) == 92,
+  ncol(X_train_scaled) == 20,
+  sum(y_train == "healthy") == 49,
+  sum(y_train == "CRC") == 43
+)
+
+train_matrix <- as.matrix(
+  X_train_scaled
+)
+
+cat("Training matrix:", nrow(train_matrix), "x", ncol(train_matrix), "\n")
+cat("Training class balance: Healthy =", sum(y_train == "healthy"),
+    "; CRC =", sum(y_train == "CRC"), "\n")
+```
+
+# Audit 1: Sample-ID and Label Integrity
+
+```{r sample-id-audit}
+sample_ids <- rownames(train_data)
+
+sample_id_audit <- data.frame(
+  N_samples = length(sample_ids),
+  N_unique_sample_ids = length(unique(sample_ids)),
+  Any_duplicate_sample_ids = anyDuplicated(sample_ids) > 0,
+  Labels_length_matches = length(y_train) == length(sample_ids),
+  Row_order_reproducible = identical(
+    rownames(X_train_scaled),
+    sample_ids
+  )
+)
+
+print(sample_id_audit)
+
+stopifnot(
+  sample_id_audit$N_samples == 92,
+  sample_id_audit$N_unique_sample_ids == 92,
+  !sample_id_audit$Any_duplicate_sample_ids,
+  sample_id_audit$Labels_length_matches
+)
+```
+
+# Audit 2: Cross-Validation Fold Structure
+
+```{r fold-audit}
+fold_names <- names(cv_folds)
+
+fold_structure <- data.frame(
+  Fold_Name = fold_names,
+  Training_Size = vapply(
+    cv_folds,
+    length,
+    integer(1)
+  )
+)
+
+fold_structure$Validation_Size <- 92 -
+  fold_structure$Training_Size
+
+print(fold_structure)
+
+stopifnot(
+  length(cv_folds) == 50,
+  all(fold_structure$Training_Size > 0),
+  all(fold_structure$Validation_Size > 0)
+)
+```
+
+```{r repeat-audit}
+extract_repeat <- function(x) {
+  as.integer(
+    sub(
+      "^Fold[0-9]+\\.Rep([0-9]+)$",
+      "\\1",
+      x
+    )
+  )
+}
+
+extract_fold <- function(x) {
+  as.integer(
+    sub(
+      "^Fold([0-9]+)\\.Rep[0-9]+$",
+      "\\1",
+      x
+    )
+  )
+}
+
+repeat_ids <- extract_repeat(fold_names)
+fold_ids <- extract_fold(fold_names)
+
+repeat_audit <- do.call(
+  rbind,
+  lapply(
+    sort(unique(repeat_ids)),
+    function(r) {
+
+      idx <- which(repeat_ids == r)
+
+      validation_indices <- lapply(
+        idx,
+        function(i) {
+          setdiff(
+            seq_len(92),
+            cv_folds[[i]]
+          )
+        }
+      )
+
+      counts <- tabulate(
+        unlist(validation_indices),
+        nbins = 92
+      )
+
+      data.frame(
+        Repeat = r,
+        Number_Folds = length(idx),
+        Every_Sample_Validated_Once = all(counts == 1),
+        Minimum_Class_Count = min(
+          vapply(
+            validation_indices,
+            function(v) {
+              min(
+                table(
+                  y_train[v]
+                )
+              )
+            },
+            numeric(1)
+          )
+        ),
+        Maximum_Validation_Size = max(
+          vapply(
+            validation_indices,
+            length,
+            integer(1)
+          )
+        )
+      )
+    }
+  )
+)
+
+print(repeat_audit)
+
+stopifnot(
+  all(repeat_audit$Number_Folds == 10),
+  all(repeat_audit$Every_Sample_Validated_Once),
+  all(repeat_audit$Minimum_Class_Count >= 1)
+)
+```
+
+# Audit 3: Saved Parameter Grid
+
+```{r grid-audit}
+expected_grid <- expand.grid(
+  max_depth        = c(2, 3, 5),
+  eta              = c(0.05, 0.1),
+  gamma            = c(0, 0.5),
+  colsample_bytree = c(0.5, 0.8),
+  min_child_weight = 1,
+  subsample        = c(0.8, 1.0)
+)
+
+parameter_columns <- c(
+  "max_depth",
+  "eta",
+  "gamma",
+  "colsample_bytree",
+  "min_child_weight",
+  "subsample"
+)
+
+saved_key <- do.call(
+  paste,
+  c(
+    saved_tuning[, parameter_columns],
+    sep = "|"
+  )
+)
+
+expected_key <- do.call(
+  paste,
+  c(
+    expected_grid[, parameter_columns],
+    sep = "|"
+  )
+)
+
+grid_audit <- data.frame(
+  Expected_Configurations = nrow(expected_grid),
+  Saved_Configurations = nrow(saved_tuning),
+  Saved_Unique_Configurations =
+    length(unique(saved_key)),
+  Grid_Set_Matches =
+    setequal(saved_key, expected_key),
+  All_Saved_AUCs_Equal_1 =
+    all(saved_tuning$best_cv_auc == 1),
+  Minimum_Saved_AUC =
+    min(saved_tuning$best_cv_auc),
+  Maximum_Saved_AUC =
+    max(saved_tuning$best_cv_auc)
+)
+
+print(grid_audit)
+
+stopifnot(
+  grid_audit$Expected_Configurations == 48,
+  grid_audit$Saved_Configurations == 48,
+  grid_audit$Saved_Unique_Configurations == 48,
+  grid_audit$Grid_Set_Matches,
+  grid_audit$Minimum_Saved_AUC == 1,
+  grid_audit$Maximum_Saved_AUC == 1
+)
+```
+
+# Audit 4: Check the Saved Final Hyperparameters
+
+```{r final-parameter-audit}
+print(saved_final_params)
+
+# The primary XGBoost notebook saves:
+#   list(params = final_params, nrounds = best_nrounds)
+# so the model parameters live inside saved_final_params$params.
+saved_model_params <- saved_final_params$params
+saved_nrounds <- saved_final_params$nrounds
+
+expected_param_names <- c(
+  "max_depth",
+  "eta",
+  "gamma",
+  "colsample_bytree",
+  "min_child_weight",
+  "subsample"
+)
+
+final_parameter_audit <- data.frame(
+  Parameter_Object_Loaded = !is.null(saved_final_params),
+  Has_Model_Parameters = !is.null(saved_model_params) &&
+    all(expected_param_names %in% names(saved_model_params)),
+  Has_Best_Nrounds = !is.null(saved_nrounds) &&
+    length(saved_nrounds) == 1 &&
+    is.finite(saved_nrounds) &&
+    saved_nrounds >= 1
+)
+
+print(final_parameter_audit)
+
+if (!all(final_parameter_audit)) {
+  stop(
+    "Saved final XGBoost parameter object does not contain the expected ",
+    "nested 'params' and 'nrounds' fields."
+  )
+}
+
+# Make the extracted values explicit for the rest of the audit.
+final_parameter_vector <- c(
+  max_depth = as.numeric(saved_model_params$max_depth),
+  eta = as.numeric(saved_model_params$eta),
+  gamma = as.numeric(saved_model_params$gamma),
+  colsample_bytree = as.numeric(saved_model_params$colsample_bytree),
+  min_child_weight = as.numeric(saved_model_params$min_child_weight),
+  subsample = as.numeric(saved_model_params$subsample),
+  nrounds = as.numeric(saved_nrounds)
+)
+
+print(final_parameter_vector)
+```
+
+# Audit 5: Check for Training/Validation Overlap
+
+```{r overlap-audit}
+overlap_audit <- lapply(
+  seq_along(cv_folds),
+  function(i) {
+
+    tr <- cv_folds[[i]]
+    va <- setdiff(
+      seq_len(92),
+      tr
+    )
+
+    list(
+      Fold = fold_names[i],
+      Any_Overlap = length(intersect(tr, va)) > 0,
+      Union_Covers_All = length(
+        union(tr, va)
+      ) == 92
+    )
+  }
+)
+
+overlap_table <- data.frame(
+  Fold = vapply(
+    overlap_audit,
+    `[[`,
+    character(1),
+    "Fold"
+  ),
+  Any_Overlap = vapply(
+    overlap_audit,
+    `[[`,
+    logical(1),
+    "Any_Overlap"
+  ),
+  Union_Covers_All = vapply(
+    overlap_audit,
+    `[[`,
+    logical(1),
+    "Union_Covers_All"
+  )
+)
+
+print(overlap_table)
+
+stopifnot(
+  !any(overlap_table$Any_Overlap),
+  all(overlap_table$Union_Covers_All)
+)
+```
+
+# Independent Manual Out-of-Fold Rerun
+
+This is the core forensic test.
+
+For each saved configuration, the reported `best_nrounds` is used. Each of the
+50 held-out folds is fitted independently with `xgb.train()`. The held-out
+probabilities are passed to `pROC` to calculate ROC AUC outside `xgb.cv()`.
+
+The process is checkpointed after every configuration so that a long audit can
+resume rather than losing all completed work if the session is interrupted.
+
+```{r manual-rerun}
+manual_one_configuration <- function(
+  config_row,
+  X,
+  y,
+  cv_folds,
+  seed_base = 1910
+) {
+
+  params <- list(
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    max_depth = as.integer(config_row$max_depth),
+    eta = as.numeric(config_row$eta),
+    gamma = as.numeric(config_row$gamma),
+    colsample_bytree = as.numeric(
+      config_row$colsample_bytree
+    ),
+    min_child_weight = as.numeric(
+      config_row$min_child_weight
+    ),
+    subsample = as.numeric(
+      config_row$subsample
+    )
+  )
+
+  nrounds <- as.integer(
+    config_row$best_nrounds
+  )
+
+  fold_aucs <- numeric(
+    length(cv_folds)
+  )
+
+  # createMultiFolds() produces training indices. Their complements are
+  # validation folds. With 5 repeats, each sample is therefore held out
+  # exactly 5 times, not once overall. Store all repeated held-out
+  # probabilities and average them per sample for a pooled repeated-CV AUC.
+  pooled_probability_sum <- numeric(
+    nrow(X)
+  )
+
+  pooled_seen <- integer(
+    nrow(X)
+  )
+
+  for (i in seq_along(cv_folds)) {
+
+    validation_idx <- setdiff(
+      seq_len(nrow(X)),
+      cv_folds[[i]]
+    )
+
+    training_idx <- cv_folds[[i]]
+
+    if (length(unique(y[validation_idx])) != 2) {
+      stop(
+        "Validation fold ", i,
+        " does not contain both classes."
+      )
+    }
+
+    dtrain <- xgboost::xgb.DMatrix(
+      data = X[training_idx, , drop = FALSE],
+      label = as.integer(
+        y[training_idx] == "CRC"
+      )
+    )
+
+    dvalidation <- xgboost::xgb.DMatrix(
+      data = X[validation_idx, , drop = FALSE],
+      label = as.integer(
+        y[validation_idx] == "CRC"
+      )
+    )
+
+    set.seed(
+      seed_base +
+        i +
+        as.integer(config_row$max_depth) * 100 +
+        round(config_row$eta * 1000)
+    )
+
+    fit <- xgboost::xgb.train(
+      params = params,
+      data = dtrain,
+      nrounds = nrounds,
+      verbose = 0
+    )
+
+    prob <- as.numeric(
+      predict(
+        fit,
+        dvalidation
+      )
+    )
+
+    fold_aucs[i] <- as.numeric(
+      pROC::auc(
+        pROC::roc(
+          response = y[validation_idx],
+          predictor = prob,
+          levels = c("healthy", "CRC"),
+          direction = "<",
+          quiet = TRUE
+        )
+      )
+    )
+
+    pooled_probability_sum[validation_idx] <-
+      pooled_probability_sum[validation_idx] + prob
+
+    pooled_seen[validation_idx] <-
+      pooled_seen[validation_idx] + 1L
+  }
+
+  # Five repeats mean each sample has five independent held-out
+  # predictions. Average those five probabilities before calculating
+  # the pooled repeated-CV AUC.
+  expected_repeats <- 5L
+
+  if (!all(pooled_seen == expected_repeats)) {
+    stop(
+      "Repeated out-of-fold predictions do not cover each sample ",
+      expected_repeats,
+      " times as expected. Observed counts: ",
+      paste(
+        sort(unique(pooled_seen)),
+        collapse = ", "
+      )
+    )
+  }
+
+  pooled_probability <-
+    pooled_probability_sum / pooled_seen
+
+  pooled_auc <- as.numeric(
+    pROC::auc(
+      pROC::roc(
+        response = y,
+        predictor = pooled_probability,
+        levels = c("healthy", "CRC"),
+        direction = "<",
+        quiet = TRUE
+      )
+    )
+  )
+
+  data.frame(
+    max_depth = config_row$max_depth,
+    eta = config_row$eta,
+    gamma = config_row$gamma,
+    colsample_bytree = config_row$colsample_bytree,
+    min_child_weight = config_row$min_child_weight,
+    subsample = config_row$subsample,
+    saved_best_nrounds = config_row$best_nrounds,
+    saved_cv_auc = config_row$best_cv_auc,
+    manual_mean_fold_auc = mean(fold_aucs),
+    manual_sd_fold_auc = sd(fold_aucs),
+    manual_min_fold_auc = min(fold_aucs),
+    manual_max_fold_auc = max(fold_aucs),
+    repeated_oof_predictions_per_sample = expected_repeats,
+    manual_pooled_oof_auc = pooled_auc,
+    all_fold_auc_equal_1 = all(
+      abs(fold_aucs - 1) < 1e-12
+    )
+  )
+}
+
+if (RUN_FULL_MANUAL_RERUN) {
+
+  if (file.exists(checkpoint_path)) {
+
+    checkpoint <- read.csv(
+      checkpoint_path,
+      stringsAsFactors = FALSE
+    )
+
+  } else {
+
+    checkpoint <- data.frame()
+
+  }
+
+  rerun_results <- list()
+
+  for (i in seq_len(nrow(saved_tuning))) {
+
+    cfg <- saved_tuning[i, ]
+
+    # Build a single scalar key from the six tuning parameters.
+    # Passing a data.frame directly to paste() can produce a vector,
+    # which then makes `if (already_done)` fail with "condition has
+    # length > 1". Explicit scalar extraction avoids that ambiguity.
+    make_config_key <- function(row) {
+      paste(
+        as.character(row$max_depth),
+        as.character(row$eta),
+        as.character(row$gamma),
+        as.character(row$colsample_bytree),
+        as.character(row$min_child_weight),
+        as.character(row$subsample),
+        sep = "|"
+      )
+    }
+
+    key <- make_config_key(cfg)
+
+    already_done <- FALSE
+
+    if (nrow(checkpoint) > 0) {
+
+      checkpoint_keys <- vapply(
+        seq_len(nrow(checkpoint)),
+        function(j) {
+          make_config_key(
+            checkpoint[j, , drop = FALSE]
+          )
+        },
+        character(1)
+      )
+
+      already_done <- isTRUE(
+        key %in% checkpoint_keys
+      )
+    }
+
+    if (already_done) {
+
+      cat(
+        "Skipping completed configuration ",
+        i,
+        "/",
+        nrow(saved_tuning),
+        "\n",
+        sep = ""
+      )
+
+      next
+    }
+
+    cat(
+      "\n===== Manual audit configuration ",
+      i,
+      " / ",
+      nrow(saved_tuning),
+      " =====\n",
+      sep = ""
+    )
+
+    result <- manual_one_configuration(
+      config_row = cfg,
+      X = train_matrix,
+      y = y_train,
+      cv_folds = cv_folds,
+      seed_base = 1910
+    )
+
+    checkpoint <- dplyr::bind_rows(
+      checkpoint,
+      result
+    )
+
+    write.csv(
+      checkpoint,
+      checkpoint_path,
+      row.names = FALSE
+    )
+
+    cat(
+      "Saved checkpoint after configuration ",
+      i,
+      ".\n",
+      sep = ""
+    )
+  }
+
+  manual_results <- checkpoint
+
+} else {
+
+  manual_results <- if (
+    file.exists(checkpoint_path)
+  ) {
+    read.csv(
+      checkpoint_path,
+      stringsAsFactors = FALSE
+    )
+  } else {
+    data.frame()
+  }
+
+}
+
+if (RUN_FULL_MANUAL_RERUN && nrow(manual_results) != 48) {
+  stop(
+    "Full manual rerun did not produce all 48 configurations. ",
+    "The checkpoint can be resumed."
+  )
+}
+
+print(manual_results)
+```
+
+# Compare Original and Independent Manual AUC
+
+```{r comparison}
+if (nrow(manual_results) > 0) {
+
+  comparison <- saved_tuning %>%
+    left_join(
+      manual_results,
+      by = parameter_columns
+    ) %>%
+    mutate(
+      Mean_Fold_AUC_Difference =
+        manual_mean_fold_auc - best_cv_auc,
+      Pooled_OOF_AUC_Difference =
+        manual_pooled_oof_auc - best_cv_auc,
+      Manual_Reproduces_Perfect_Mean =
+        abs(
+          manual_mean_fold_auc - 1
+        ) < 1e-12,
+      Manual_Reproduces_Perfect_Pooled =
+        abs(
+          manual_pooled_oof_auc - 1
+        ) < 1e-12
+    )
+
+  write.csv(
+    comparison,
+    file.path(
+      audit_root,
+      "XGBoost_Original_vs_Manual_AUC_Comparison.csv"
+    ),
+    row.names = FALSE
+  )
+
+  print(
+    comparison[
+      ,
+      c(
+        parameter_columns,
+        "saved_best_nrounds",
+        "saved_cv_auc",
+        "manual_mean_fold_auc",
+        "manual_pooled_oof_auc",
+        "Mean_Fold_AUC_Difference",
+        "Pooled_OOF_AUC_Difference"
+      )
+    ]
+  )
+}
+```
+
+# Forensic Interpretation
+
+```{r interpretation}
+if (nrow(manual_results) == 48) {
+
+  forensic_summary <- data.frame(
+    Saved_Configurations = 48,
+    Saved_All_AUC_Exactly_1 =
+      all(saved_tuning$best_cv_auc == 1),
+    Manual_Mean_AUC_All_Exactly_1 =
+      all(
+        abs(
+          manual_results$manual_mean_fold_auc - 1
+        ) < 1e-12
+      ),
+    Manual_Pooled_OOF_AUC_All_Exactly_1 =
+      all(
+        abs(
+          manual_results$manual_pooled_oof_auc - 1
+        ) < 1e-12
+      ),
+    Manual_Min_Mean_Fold_AUC =
+      min(
+        manual_results$manual_mean_fold_auc
+      ),
+    Manual_Max_Mean_Fold_AUC =
+      max(
+        manual_results$manual_mean_fold_auc
+      ),
+    Manual_Min_Pooled_OOF_AUC =
+      min(
+        manual_results$manual_pooled_oof_auc
+      ),
+    Manual_Max_Pooled_OOF_AUC =
+      max(
+        manual_results$manual_pooled_oof_auc
+      )
+  )
+
+  print(forensic_summary)
+
+  write.csv(
+    forensic_summary,
+    file.path(
+      audit_root,
+      "XGBoost_Forensic_Summary.csv"
+    ),
+    row.names = FALSE
+  )
+}
+```
+
+# Final Audit Checklist
+
+```{r final-audit}
+final_audit <- data.frame(
+  Item = c(
+    "Exactly 92 discovery-training samples reconstructed",
+    "Training labels are 49 Healthy / 43 CRC",
+    "Exactly 20 saved XGBoost features reconstructed",
+    "No duplicated training sample IDs",
+    "50 saved CV folds present",
+    "10 folds in each of 5 repeats",
+    "Each sample held out exactly once per repeat",
+    "Every validation fold contains both classes",
+    "No training/validation index overlap",
+    "Saved parameter grid contains exactly 48 unique configurations",
+    "Every saved original best CV AUC equals 1",
+    "Saved final parameter object loaded",
+    "Independent manual rerun completed for all 48 configurations",
+    "Manual fold AUCs are finite and within [0, 1]"
+  ),
+  Verified = c(
+    nrow(X_train_scaled) == 92,
+    sum(y_train == "healthy") == 49 &&
+      sum(y_train == "CRC") == 43,
+    ncol(X_train_scaled) == 20,
+    length(unique(sample_ids)) == 92,
+    length(cv_folds) == 50,
+    all(repeat_audit$Number_Folds == 10),
+    all(repeat_audit$Every_Sample_Validated_Once),
+    all(repeat_audit$Minimum_Class_Count >= 1),
+    !any(overlap_table$Any_Overlap),
+    grid_audit$Expected_Configurations == 48 &&
+      grid_audit$Saved_Unique_Configurations == 48 &&
+      grid_audit$Grid_Set_Matches,
+    all(saved_tuning$best_cv_auc == 1),
+    all(final_parameter_audit),
+    nrow(manual_results) == 48,
+    all(
+      is.finite(
+        manual_results$manual_mean_fold_auc
+      )
+    ) &&
+      all(
+        manual_results$manual_mean_fold_auc >= 0 &
+          manual_results$manual_mean_fold_auc <= 1
+      )
+  )
+)
+
+print(final_audit)
+
+write.csv(
+  final_audit,
+  file.path(
+    audit_root,
+    "XGBoost_Forensic_Audit_Checklist.csv"
+  ),
+  row.names = FALSE
+)
+
+if (!all(final_audit$Verified)) {
+  stop(
+    "Forensic audit checklist failed. Do not treat the original XGBoost CV ",
+    "result as validated until the failed checks are resolved."
+  )
+}
+```
+
+
+
+## Session information
+
+The final section records the exact R session used for this knit. The same information is also saved as a text artifact so the HTML report and repository contain both a human-readable and machine-readable provenance record.
+
+```{r session-information}
+session_file <- file.path(
+  results_dir,
+  "session_info",
+  "08_XGBoost_Forensic_Audit_sessionInfo.txt"
+)
+write_session_info(session_file)
+cat("Saved session information to:", session_file, "\n\n")
+sessionInfo()
+```

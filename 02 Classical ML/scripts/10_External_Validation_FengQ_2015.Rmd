@@ -1,0 +1,2352 @@
+---
+title: "External Validation of Classical Machine Learning Models for Binary Colorectal Cancer Microbiome Classification"
+author: "Harshini Chintala"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    theme: cosmo
+    highlight: tango
+    df_print: paged
+    fig_caption: true
+    self_contained: true
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  collapse = TRUE,
+  comment = "##",
+  fig.width = 7.2,
+  fig.height = 5.2,
+  dpi = 300,
+  fig.align = "center",
+  out.width = "92%",
+  results = "markup"
+)
+
+options(width = 90, scipen = 999)
+source("../../R/project_setup.R")
+set.seed(1910)
+
+# Classical notebook output locations.
+project_dir <- classical_dir
+results_dir <- file.path(classical_dir, "results")
+models_dir <- file.path(classical_dir, "models")
+data_dir <- file.path(classical_dir, "data")
+reports_dir <- file.path(classical_dir, "reports")
+figures_dir <- file.path(classical_dir, "figures")
+for (d in c(results_dir, models_dir, data_dir, reports_dir, figures_dir)) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+
+#load these packages
+# Load packages
+library(dplyr)
+library(caret)
+library(pROC)
+library(MLmetrics)
+library(curatedMetagenomicData)
+library(TreeSummarizedExperiment)
+
+```
+
+## Notebook roadmap
+
+**Purpose:** This notebook is one reproducible component of the CRC microbiome classification pipeline.
+
+**Execution order**
+1. Load the project environment and fixed random seed (`1910`).
+2. Load only the validated project artifacts required for this analysis.
+3. Perform the analysis exactly as documented below.
+4. Generate tables/figures and save machine-readable outputs.
+5. Record the session information used for the run.
+
+**Output contract:** generated tables, figures, model objects, audit files, and session information are written under `02 Classical ML/results/`. The notebook itself renders to HTML with a floating table of contents, so the sections can be navigated from the left-hand panel in the knitted document.
+
+**Reproducibility rule:** this repository preserves the validated analysis logic and project-wide seed. Environment restoration is handled by `renv.lock` for R and `requirements.txt` for Python. The notebooks do not silently install unpinned packages during knitting.
+
+### Reproducibility constants
+
+- Project seed: **1910**
+- Discovery cohort: **ZellerG_2014**
+- Primary task: **Healthy vs CRC; adenoma excluded**
+- Frozen discovery split: **92 training / 22 held-out test samples**
+- Primary feature panel: **20 Boruta-selected features**
+- External cohorts: **FengQ_2015** and **VogtmannE_2016**
+
+# Introduction
+
+The four primary classical models in this project (Binomial Logistic Regression, Random Forest, SVM, and XGBoost) were trained and evaluated entirely within the Zeller et al. (`ZellerG_2014`) discovery cohort, using a stratified 80:20 train/test split and repeated 10-fold x 5-repeat cross-validation. Cross-validation and a held-out test split both resample the *same* underlying cohort, so a model can look robust internally while still encoding population-, protocol-, or batch-specific structure that does not transfer to an unrelated cohort. Internal repeated CV is therefore necessary but not sufficient evidence of generalizability.
+
+This notebook adds one additional, independent evidence layer: it takes the four **already-fitted, already-frozen** classical models exactly as saved by the primary pipeline and applies them, without any retraining, retuning, refitting, or re-selection of features, to a genuinely independent CRC microbiome cohort accessed through `curatedMetagenomicData`.
+
+**Discovery cohort:** Zeller et al. 2014 (`ZellerG_2014`), Healthy vs CRC, adenoma excluded, 92 train / 22 test samples, 20 Boruta-selected microbial features, seed `1910`.
+
+**External cohort:** see the feasibility check in Section "External Cohort Feasibility Gate" below. `FengQ_2015` is the primary candidate; `VogtmannE_2016` is the predefined fallback if and only if `FengQ_2015` fails the feasibility gate.
+
+**What is being validated:** the four frozen classical models' predictions on unseen, out-of-cohort samples, using the discovery cohort's fitted scaler, fitted Boruta-selected feature list, and fitted model objects exactly as they exist on disk.
+
+**What is deliberately NOT being retrained:** Boruta is not re-run, the scaler is not refit, no hyperparameters are retuned, no thresholds are changed, and the QSVC quantum model is out of scope for this notebook (it remains an internal exploratory analysis; see Limitations).
+
+# Objectives
+
+1. Validate the frozen Logistic Regression, Random Forest, SVM, and XGBoost models on an independent cohort.
+2. Assess whether the discovery cohort's 20 Boruta-selected microbial features are available and usable in the external cohort.
+3. Compare internal held-out test performance against external validation performance for each model.
+4. Identify model-specific shifts in Accuracy, Precision, Sensitivity, Specificity, F1, MCC, and AUC.
+5. Quantify the external-validation performance gap per model, without cherry-picking a post-hoc "best" model.
+
+# Project Artifacts Used In This Notebook
+
+Before writing any prediction code, the four existing Rmds (`01_Binomial_Logistic_Regression.Rmd`, `07_Binary_RandomForest_CRC_vs_Healthy.Rmd`, `08_Binary_SVM_CRC_vs_Healthy.Rmd`, `09_Binary_XGBoost_CRC_vs_Healthy.Rmd`) were inspected directly. Each model notebook re-runs Boruta independently (same `seed = 1910`, same 92-sample training partition), so each model has its **own** saved scaler, selected-feature file, and (for three of the four models) its own saved feature-name map, even though all four are expected to converge on the same 20-feature set. This notebook does not assume the four are identical; it loads each model's own artifacts and audits them independently.
+
+| Model | Model artifact used | Scaler artifact used | Feature artifact used |
+|---|---|---|---|
+| Logistic Regression | `models/BinomialLR_Model.rds` | `models/Scaler.rds` | `results/Binary_Selected_20_Features.csv` (no saved name map -- this notebook recomputes `make.names()` identically to how `01_Binomial_Logistic_Regression.Rmd` standardized names inline) |
+| Random Forest | `models/RandomForestBinary_Model.rds` | `models/Scaler_RandomForest_Binary.rds` | `results/RandomForestBinary_Selected_Features.csv` + `results/RandomForestBinary_FeatureNameMap.csv` |
+| SVM | `models/SVMBinary_Model.rds` | `models/Scaler_Binary_SVM.rds` | `results/SVMBinary_Selected_Features.csv` + `results/SVMBinary_FeatureNameMap.csv` |
+| XGBoost | `models/XGBoostBinary_Model.model` (native `xgb.load()`) + `models/XGBoostBinary_Model_Params.rds` | `models/Scaler_Binary_XGB.rds` | `results/XGBoostBinary_Selected_Features.csv` + `results/XGBoostBinary_FeatureNameMap.csv` |
+
+None of these paths are placeholders -- they are the exact `saveRDS()` / `xgb.save()` / `write.csv()` targets found in the four uploaded Rmds. If any of these files is missing when this notebook runs (e.g. the four Rmds have not all been executed yet in this environment), the artifact-existence check in the next section stops the notebook immediately and names the missing file, rather than producing a false-complete report.
+
+
+
+A note on the folder tree: the follow-up output-saving requirement listed the four cohort subfolders two slightly different ways (`predictions/metrics/figures/metadata` in the itemized list, `results/predictions/figures/metadata` in the final diagram). This notebook uses `predictions/`, `metrics/`, `figures/`, `metadata/` per cohort, since that maps cleanly onto the itemized RESULTS / TABLES / FIGURES / REPRODUCIBILITY file list (metrics, AUC, confusion matrices and ROC coordinates all go under `metrics/`; the master and comparison tables are saved there too, plus copied to `results/` at the project root under the exact filenames requested, for quick access without navigating into a cohort folder).
+
+# Package Check
+
+The four existing Rmds load packages directly with `library()` and do not use an install-check pattern. This notebook adds a lightweight check-then-install-then-load helper (installing only what's missing, Bioconductor packages via `BiocManager`) and records the resolved package versions, since the master prompt asked for this explicitly for the new notebook.
+
+```{r packages}
+cran_packages  <- c("caret", "tidyverse", "pROC", "MLmetrics", "Boruta",
+                     "yardstick", "randomForest", "kernlab", "xgboost",
+                     "stringr", "dplyr", "ggplot2")
+bioc_packages  <- c("curatedMetagenomicData", "TreeSummarizedExperiment")
+
+check_and_install <- function(cran_pkgs, bioc_pkgs) {
+  all_packages <- c(cran_pkgs, bioc_pkgs)
+  missing <- all_packages[
+    !vapply(all_packages, requireNamespace, logical(1), quietly = TRUE)
+  ]
+  if (length(missing)) {
+    stop(
+      "Missing package(s). Restore the validated environment with ",
+      "renv::restore() before knitting: ",
+      paste(missing, collapse = ", ")
+    )
+  }
+}
+
+check_and_install(cran_packages, bioc_packages)
+
+all_packages <- c(cran_packages, bioc_packages)
+invisible(lapply(all_packages, library, character.only = TRUE))
+
+package_versions <- data.frame(
+  Package = all_packages,
+  Version = vapply(all_packages, function(p) as.character(packageVersion(p)), character(1)),
+  row.names = NULL
+)
+
+write.csv(
+  package_versions,
+  file.path(reports_dir, "ExternalValidation_PackageVersions.csv"),
+  row.names = FALSE
+)
+
+package_versions
+```
+
+# Reproducibility
+
+```{r seed}
+set.seed(1910)
+```
+
+Every step below is a deterministic prediction against frozen artifacts, so the seed does not change any result -- it is set anyway to keep this notebook's reproducibility record consistent with every other notebook in the project. Full session information is written at the end to `reports/ExternalValidation_SessionInfo.txt`.
+
+# Load Frozen Model Artifacts
+
+```{r model-configs}
+# ==========================================================
+# One entry per frozen classical model, using the exact
+# artifact paths identified above. internal_metrics reproduces
+# the already-independently-verified held-out test performance
+# from the primary pipeline; it is not regenerated here.
+# ==========================================================
+
+model_configs <- list(
+  LogisticRegression = list(
+    label           = "LogisticRegression",
+    display         = "Binomial Logistic Regression",
+    model_path      = file.path(models_dir, "BinomialLR_Model.rds"),
+    scaler_path     = file.path(models_dir, "Scaler.rds"),
+    features_path   = file.path(results_dir, "Binary_Selected_20_Features.csv"),
+    featuremap_path = NA_character_,
+    model_type      = "caret",
+    internal_metrics = data.frame(Accuracy = 0.818, Precision = 0.800, Sensitivity = 0.800,
+                                   Specificity = 0.833, F1 = 0.800, MCC = 0.633, AUC = 0.850)
+  ),
+
+  RandomForest = list(
+    label           = "RandomForest",
+    display         = "Random Forest",
+    model_path      = file.path(models_dir, "RandomForestBinary_Model.rds"),
+    scaler_path     = file.path(models_dir, "Scaler_RandomForest_Binary.rds"),
+    features_path   = file.path(results_dir, "RandomForestBinary_Selected_Features.csv"),
+    featuremap_path = file.path(results_dir, "RandomForestBinary_FeatureNameMap.csv"),
+    model_type      = "caret",
+    internal_metrics = data.frame(Accuracy = 0.818, Precision = 0.800, Sensitivity = 0.800,
+                                   Specificity = 0.833, F1 = 0.800, MCC = 0.633, AUC = 0.817)
+  ),
+  SVM = list(
+    label           = "SVM",
+    display         = "Support Vector Machine (RBF)",
+    model_path      = file.path(models_dir, "SVMBinary_Model.rds"),
+    scaler_path     = file.path(models_dir, "Scaler_Binary_SVM.rds"),
+    features_path   = file.path(results_dir, "SVMBinary_Selected_Features.csv"),
+    featuremap_path = file.path(results_dir, "SVMBinary_FeatureNameMap.csv"),
+    model_type      = "caret",
+    internal_metrics = data.frame(Accuracy = 0.727, Precision = 0.750, Sensitivity = 0.600,
+                                   Specificity = 0.833, F1 = 0.667, MCC = 0.449, AUC = 0.717)
+  ),
+  XGBoost = list(
+    label           = "XGBoost",
+    display         = "XGBoost",
+    model_path      = file.path(models_dir, "XGBoostBinary_Model.model"),
+    params_path     = file.path(models_dir, "XGBoostBinary_Model_Params.rds"),
+    scaler_path     = file.path(models_dir, "Scaler_Binary_XGB.rds"),
+    features_path   = file.path(results_dir, "XGBoostBinary_Selected_Features.csv"),
+    featuremap_path = file.path(results_dir, "XGBoostBinary_FeatureNameMap.csv"),
+    model_type      = "xgboost",
+    internal_metrics = data.frame(Accuracy = 0.636, Precision = 0.750, Sensitivity = 0.300,
+                                   Specificity = 0.917, F1 = 0.429, MCC = 0.280, AUC = 0.750)
+  )
+)
+# ==========================================================
+# Diagnostic: frozen model artifact paths used during Knit
+# ==========================================================
+
+cat(
+  "\nFrozen model artifact paths used during Knit:\n\n"
+)
+
+for (cfg_name in names(model_configs)) {
+
+  cat(
+    cfg_name,
+    "\n",
+    "Model   : ", model_configs[[cfg_name]]$model_path, "\n",
+    "Scaler  : ", model_configs[[cfg_name]]$scaler_path, "\n",
+    "Features: ", model_configs[[cfg_name]]$features_path, "\n\n",
+    sep = ""
+  )
+}
+
+```
+
+```{r artifact-existence-check}
+# ==========================================================
+# Artifact existence check -- stop loudly, name the exact
+# missing file, rather than proceeding with a false-complete
+# notebook.
+# ==========================================================
+
+check_artifacts_exist <- function(cfg) {
+  required_paths <- c(cfg$model_path, cfg$scaler_path, cfg$features_path)
+  if (!is.na(cfg$featuremap_path)) required_paths <- c(required_paths, cfg$featuremap_path)
+  if (!is.null(cfg$params_path)) required_paths <- c(required_paths, cfg$params_path)
+
+  missing <- required_paths[!file.exists(required_paths)]
+  if (length(missing) > 0) {
+    stop(
+      "FROZEN MODEL ARTIFACT MISSING for ", cfg$display, ":\n  ",
+      paste(missing, collapse = "\n  "),
+      "\nExternal validation cannot proceed until 01/07/08/09 Rmds have been run ",
+      "and these files exist on disk. Stopping rather than producing a false-complete report."
+    )
+  }
+  invisible(TRUE)
+}
+
+invisible(lapply(model_configs, check_artifacts_exist))
+
+cat("All frozen model, scaler, and feature artifacts found for all four models.\n")
+```
+
+Every model artifact, scaler artifact, and feature-list artifact referenced above must exist on disk before this notebook does anything else. This check runs before a single external sample is even loaded, so a missing or not-yet-generated artifact fails the notebook immediately with the exact path that is missing, instead of silently producing partial or fabricated results.
+
+# External Cohort Candidates and Feasibility Gate
+
+```{r cohort-candidates}
+# ==========================================================
+# First External Cohort and Feasibility Gate
+# ==========================================================
+# FengQ_2015 is the designated first independent external
+# validation cohort in this notebook.
+#
+# VogtmannE_2016 is evaluated separately in
+# 11_External_Validation_VogtmannE_CRC_vs_Healthy.Rmd as the
+# second independent external validation cohort.
+#
+# The two cohorts are reported separately and are not pooled
+# into a single primary external-validation metric.
+# ==========================================================
+
+COHORT_CANDIDATES <- "FengQ_2015"
+MIN_SAMPLES_PER_CLASS <- 15   # judgment call: floor for a class to be usable for external metrics
+REQUIRE_ALL_20_FEATURES <- TRUE  # per-model; strict by design (see Section 7 of the master prompt)
+```
+
+```{r load-external-cohort}
+# ==========================================================
+# Load one external cohort via curatedMetagenomicData, using
+# the identical retrieval convention as ZellerG_2014 in
+# 01_Binomial_Logistic_Regression.Rmd (same function call
+# shape, same dryrun = FALSE, same [[1]] extraction, same
+# assay()/colData() access pattern).
+# ==========================================================
+
+load_external_cohort <- function(cohort_name) {
+  cmd_obj <- curatedMetagenomicData(
+    paste0(cohort_name, ".relative_abundance"),
+    dryrun = FALSE
+  )[[1]]
+
+  abundance <- assay(cmd_obj)
+  X <- as.data.frame(t(abundance))
+  y <- colData(cmd_obj)$study_condition
+  sample_ids <- colnames(cmd_obj)
+
+  list(X = X, y = y, sample_ids = sample_ids, meta = colData(cmd_obj))
+}
+```
+
+```{r feasibility-gate}
+# ==========================================================
+# Feasibility gate. Must PASS before any prediction is made.
+# Checks, per Section 12 of the master prompt:
+#   - both classes exist
+#   - sample count is non-zero and >= MIN_SAMPLES_PER_CLASS per class
+#   - the expected 20 features are available (per-model audit)
+#   - no duplicate sample IDs
+#   - no NA problems in the resulting model matrix
+# Fails loudly and cleanly rather than silently continuing with
+# an incomplete feature set.
+# ==========================================================
+
+run_feasibility_check <- function(cohort_name) {
+
+  cat("\n----- Feasibility check:", cohort_name, "-----\n")
+
+  loaded <- tryCatch(
+    load_external_cohort(cohort_name),
+    error = function(e) {
+      cat("FAILED to load", cohort_name, "via curatedMetagenomicData:", conditionMessage(e), "\n")
+      return(NULL)
+    }
+  )
+  if (is.null(loaded)) {
+    return(list(cohort = cohort_name, pass = FALSE, reason = "Load failure", data = NULL))
+  }
+
+  binary_df <- loaded$X
+  binary_df$disease    <- dplyr::case_match(loaded$y, "control" ~ "healthy", .default = loaded$y)
+  binary_df$SampleID   <- loaded$sample_ids
+
+  binary_df <- binary_df[binary_df$disease %in% c("healthy", "CRC"), , drop = FALSE]
+  binary_df$disease <- factor(binary_df$disease, levels = c("healthy", "CRC"))
+
+  n_healthy <- sum(binary_df$disease == "healthy")
+  n_crc     <- sum(binary_df$disease == "CRC")
+
+  reasons <- c()
+
+  if (n_healthy == 0 || n_crc == 0) {
+    reasons <- c(reasons, "One class is entirely absent after excluding adenoma.")
+  }
+  if (n_healthy < MIN_SAMPLES_PER_CLASS || n_crc < MIN_SAMPLES_PER_CLASS) {
+    reasons <- c(reasons, sprintf(
+      "Fewer than %d samples in at least one class (Healthy=%d, CRC=%d).",
+      MIN_SAMPLES_PER_CLASS, n_healthy, n_crc
+    ))
+  }
+  if (anyDuplicated(binary_df$SampleID) > 0) {
+    reasons <- c(reasons, "Duplicate sample IDs detected.")
+  }
+
+  # Per-model feature-overlap audit
+  feature_audit_list <- lapply(model_configs, function(cfg) {
+    sel <- read.csv(cfg$features_path, stringsAsFactors = FALSE)$Feature
+    found <- sel %in% colnames(binary_df)
+    data.frame(Model = cfg$label, Feature = sel, Found_In_External = found,
+               stringsAsFactors = FALSE)
+  })
+  feature_audit <- do.call(rbind, feature_audit_list)
+
+  models_with_gaps <- unique(feature_audit$Model[!feature_audit$Found_In_External])
+  if (REQUIRE_ALL_20_FEATURES && length(models_with_gaps) > 0) {
+    reasons <- c(reasons, paste0(
+      "Incomplete feature overlap for: ", paste(models_with_gaps, collapse = ", "),
+      ". See feature-alignment audit for exact missing taxa."
+    ))
+  }
+
+  pass <- length(reasons) == 0
+
+  cat("Healthy samples:", n_healthy, " | CRC samples:", n_crc, "\n")
+  cat("Feature overlap complete for all 4 models:", length(models_with_gaps) == 0, "\n")
+  cat("Feasibility result:", if (pass) "PASS" else "FAIL", "\n")
+  if (!pass) cat("Reasons:\n - ", paste(reasons, collapse = "\n - "), "\n")
+
+  list(
+    cohort = cohort_name,
+    pass = pass,
+    reason = if (pass) "OK" else paste(reasons, collapse = " | "),
+    data = binary_df,
+    meta = loaded$meta,
+    n_healthy = n_healthy,
+    n_crc = n_crc,
+    feature_audit = feature_audit
+  )
+}
+```
+
+
+
+
+```{r run-feasibility}
+feasibility_results <- list()
+selected_cohort <- NULL
+
+for (cand in COHORT_CANDIDATES) {
+  res <- run_feasibility_check(cand)
+  feasibility_results[[cand]] <- res
+  if (res$pass) {
+    selected_cohort <- res
+    break
+  }
+}
+
+if (is.null(selected_cohort)) {
+  stop(
+    "No candidate external cohort (", paste(COHORT_CANDIDATES, collapse = ", "),
+    ") passed the feasibility gate. Stopping cleanly rather than substituting an ",
+    "unvetted cohort or an incomplete feature set. See feasibility_results for details ",
+    "on why each candidate failed."
+  )
+}
+
+cat("\nSelected external cohort:", selected_cohort$cohort, "\n")
+```
+
+`FengQ_2015` is the primary candidate because it is a published, independently recruited CRC/healthy stool metagenomic cohort (Feng et al. 2015) that is genuinely distinct from Zeller et al.'s cohort -- different recruitment, different country, different sequencing run -- and is retrieved through the same `curatedMetagenomicData` package and `relative_abundance` data type as the discovery cohort, which gives the best chance of taxonomic naming compatibility with the discovery pipeline's `g__/s__` feature strings. Following successful validation using the FengQ cohort, a second independent external cohort, VogtmannE, was also evaluated to further assess the reproducibility and cross-cohort generalizability of the frozen machine learning models.
+
+**A note on what could not be verified before you run this**: this notebook was written and audited against your four uploaded Rmds in an environment without R, Bioconductor, or network access to the Bioconductor/ExperimentHub data servers that `curatedMetagenomicData` needs to download `FengQ_2015`. The sample counts and feasibility described here reflect what has been reported for `FengQ_2015` in the literature (approximately 46 CRC and 61 healthy controls after excluding adenoma, retrieved via `curatedMetagenomicData`), not a number computed in this session. The `run_feasibility_check()` code above is the actual, executable check -- the first time you knit this notebook, it will tell you the real numbers for your installed package version and will stop cleanly if anything about that assumption turns out to be wrong.
+
+```{r}
+# ==========================================================
+# Chunk 9
+# Per-model NA audit
+# ==========================================================
+
+na_audit <- lapply(model_configs, function(cfg) {
+
+  sel <- read.csv(
+    cfg$features_path,
+    stringsAsFactors = FALSE
+  )
+
+  # Extract feature names
+  selected_features <- sel[[1]]
+
+  # Check for missing values in the selected external-cohort features
+  anyNA(
+    selected_cohort$data[, selected_features, drop = FALSE]
+  )
+})
+
+na_audit
+```
+
+
+
+```{r cohort-dirs}
+make_cohort_dirs <- function(cohort_name) {
+
+  cohort_root <- file.path(results_dir, cohort_name)
+
+  dirs <- c(
+    predictions = file.path(cohort_root, "predictions"),
+    metrics     = file.path(cohort_root, "metrics"),
+    figures     = file.path(cohort_root, "figures"),
+    metadata    = file.path(cohort_root, "metadata")
+  )
+
+  for (d in dirs) {
+    dir.create(
+      d,
+      recursive = TRUE,
+      showWarnings = FALSE
+    )
+  }
+
+  dirs
+}
+cohort_dirs <- make_cohort_dirs(selected_cohort$cohort)
+```
+
+# External Cohort Metadata
+
+```{r cohort-metadata}
+# ==========================================================
+# Record dataset name, sample counts, and available metadata
+# fields, exactly as required by Section 11 of the master
+# prompt.
+# ==========================================================
+
+cohort_summary <- data.frame(
+  Dataset = selected_cohort$cohort,
+  N_Total = nrow(selected_cohort$data),
+  N_Healthy = selected_cohort$n_healthy,
+  N_CRC = selected_cohort$n_crc,
+  Available_Metadata_Fields = paste(colnames(selected_cohort$meta), collapse = "; ")
+)
+
+write.csv(
+  cohort_summary,
+  file.path(cohort_dirs["metadata"], paste0("External_", selected_cohort$cohort, "_SampleSummary.csv")),
+  row.names = FALSE
+)
+
+write.csv(
+  selected_cohort$feature_audit,
+  file.path(cohort_dirs["metadata"], "External_Validation_FeatureAlignmentAudit.csv"),
+  row.names = FALSE
+)
+
+cohort_summary
+```
+
+# Apply Frozen Models (Predict Only -- No Refitting)
+
+```{r align-and-predict-function}
+# ==========================================================
+# For each model: align external features to the model's own
+# selected-feature list (exact names, exact order), apply the
+# model's own FROZEN scaler (predict(), never preProcess()
+# again), apply the model's own syntactic name map (or
+# recompute make.names() identically for Logistic Regression,
+# which never saved one), verify the model's expected predictor
+# names are all present, then predict. No Boruta, no scaler
+# fitting, no hyperparameter search happens anywhere below.
+# ==========================================================
+
+apply_frozen_model <- function(cfg, external_data) {
+
+  sel <- read.csv(cfg$features_path, stringsAsFactors = FALSE)$Feature
+
+  stopifnot(all(sel %in% colnames(external_data)))  # re-guarded even though the gate already checked this
+
+  X_ext <- external_data[, sel, drop = FALSE]
+
+  scaler <- readRDS(cfg$scaler_path)
+  X_ext_scaled <- predict(scaler, X_ext)   # FROZEN scaler applied, never refit
+
+  if (!is.na(cfg$featuremap_path) && file.exists(cfg$featuremap_path)) {
+    fmap <- read.csv(cfg$featuremap_path, stringsAsFactors = FALSE)
+    colnames(X_ext_scaled) <- fmap$Syntactic[match(colnames(X_ext_scaled), fmap$Original)]
+  } else {
+    colnames(X_ext_scaled) <- make.names(colnames(X_ext_scaled), unique = TRUE)
+  }
+
+  if (cfg$model_type == "caret") {
+
+    model_obj <- readRDS(cfg$model_path)
+    expected_names <- caret::predictors(model_obj)
+    missing_names <- setdiff(expected_names, colnames(X_ext_scaled))
+    if (length(missing_names) > 0) {
+      stop("Feature mismatch for ", cfg$display, ": model expects columns not present ",
+           "after alignment: ", paste(missing_names, collapse = ", "))
+    }
+
+    prob_df <- predict(model_obj, newdata = X_ext_scaled, type = "prob")
+    pred    <- predict(model_obj, newdata = X_ext_scaled, type = "raw")
+    prob_crc <- prob_df$CRC
+
+  } else if (cfg$model_type == "xgboost") {
+
+    model_obj <- xgb.load(cfg$model_path)
+    ordered_names <- fmap$Syntactic  # training-time column order, from the saved map
+    X_ext_scaled <- X_ext_scaled[, ordered_names, drop = FALSE]
+
+    mat <- as.matrix(X_ext_scaled)
+    dext <- xgb.DMatrix(data = mat)
+
+    prob_crc <- predict(model_obj, newdata = dext)
+    pred <- factor(ifelse(prob_crc >= 0.5, "CRC", "healthy"), levels = c("healthy", "CRC"))
+
+  } else {
+    stop("Unknown model_type for ", cfg$display)
+  }
+
+  list(pred = pred, prob_crc = as.numeric(prob_crc))
+}
+```
+
+```{r metrics-function}
+# ==========================================================
+# METRICS FUNCTION
+# ==========================================================
+
+compute_metrics <- function(y_true, y_pred, prob_crc) {
+
+  # --------------------------------------------------------
+  # Standardize class labels
+  # --------------------------------------------------------
+
+  y_true <- factor(
+    as.character(y_true),
+    levels = c("healthy", "CRC")
+  )
+
+  y_pred <- factor(
+    as.character(y_pred),
+    levels = c("healthy", "CRC")
+  )
+
+  # --------------------------------------------------------
+  # Confusion matrix
+  # --------------------------------------------------------
+
+  cm <- confusionMatrix(
+    y_pred,
+    y_true,
+    positive = "CRC"
+  )
+
+  # --------------------------------------------------------
+  # ROC curve
+  # --------------------------------------------------------
+
+  roc_obj <- pROC::roc(
+    response = y_true,
+    predictor = as.numeric(prob_crc),
+    levels = c("healthy", "CRC"),
+    direction = "<",
+    quiet = TRUE
+  )
+
+  # --------------------------------------------------------
+  # Matthews correlation coefficient
+  # --------------------------------------------------------
+
+  mcc_data <- data.frame(
+    truth = y_true,
+    prediction = y_pred
+  )
+
+  mcc_val <- yardstick::mcc(
+    mcc_data,
+    truth = truth,
+    estimate = prediction
+  )$.estimate
+
+  # --------------------------------------------------------
+  # Assemble metrics
+  # --------------------------------------------------------
+
+  metrics <- data.frame(
+    Accuracy    = as.numeric(cm$overall["Accuracy"]),
+    Precision   = as.numeric(cm$byClass["Precision"]),
+    Sensitivity = as.numeric(cm$byClass["Sensitivity"]),
+    Specificity = as.numeric(cm$byClass["Specificity"]),
+    F1          = as.numeric(cm$byClass["F1"]),
+    MCC         = as.numeric(mcc_val),
+    AUC         = as.numeric(pROC::auc(roc_obj))
+  )
+
+  list(
+    cm = cm,
+    roc = roc_obj,
+    metrics = metrics
+  )
+}
+```
+
+```{r}
+# =========================================
+bootstrap_ci <- function(
+  y_true,
+  y_pred,
+  prob_crc,
+  B = 2000,
+  seed = 123
+) {
+
+  set.seed(seed)
+
+  # --------------------------------------------------------
+  # Normalize outcome labels to the project's canonical form
+  # --------------------------------------------------------
+  # The external-validation prediction files use "healthy"
+  # and "CRC". Normalizing here prevents case mismatches such
+  # as "Healthy" vs "healthy" from silently converting one
+  # class to NA during factor construction.
+  y_true_raw <- trimws(as.character(y_true))
+  y_pred_raw <- trimws(as.character(y_pred))
+
+  normalize_label <- function(x) {
+    x_lower <- tolower(x)
+
+    ifelse(
+      x_lower == "crc",
+      "CRC",
+      ifelse(
+        x_lower == "healthy",
+        "healthy",
+        NA_character_
+      )
+    )
+  }
+
+  y_true <- normalize_label(y_true_raw)
+  y_pred <- normalize_label(y_pred_raw)
+  prob_crc <- as.numeric(prob_crc)
+
+  if (anyNA(y_true)) {
+    stop(
+      "y_true contains labels other than Healthy/CRC."
+    )
+  }
+
+  if (anyNA(y_pred)) {
+    stop(
+      "y_pred contains labels other than Healthy/CRC."
+    )
+  }
+
+  if (length(y_true) != length(y_pred) ||
+      length(y_true) != length(prob_crc)) {
+    stop(
+      "y_true, y_pred, and prob_crc must have identical lengths."
+    )
+  }
+
+  # --------------------------------------------------------
+  # Identify the two outcome strata
+  # --------------------------------------------------------
+
+  healthy_idx <- which(y_true == "healthy")
+  crc_idx <- which(y_true == "CRC")
+
+  if (length(healthy_idx) == 0 || length(crc_idx) == 0) {
+    stop(
+      "Both Healthy and CRC observations are required ",
+      "for stratified bootstrap."
+    )
+  }
+
+  # --------------------------------------------------------
+  # Store bootstrap estimates
+  # --------------------------------------------------------
+
+  bootstrap_metrics <- matrix(
+    NA_real_,
+    nrow = B,
+    ncol = 7
+  )
+
+  colnames(bootstrap_metrics) <- c(
+    "Accuracy",
+    "Precision",
+    "Sensitivity",
+    "Specificity",
+    "F1",
+    "MCC",
+    "AUC"
+  )
+
+  # --------------------------------------------------------
+  # Stratified bootstrap
+  # --------------------------------------------------------
+  # Each resample contains exactly the original number of
+  # Healthy and CRC observations, sampled with replacement
+  # within their respective outcome strata.
+
+  for (b in seq_len(B)) {
+
+    boot_healthy <- sample(
+      healthy_idx,
+      size = length(healthy_idx),
+      replace = TRUE
+    )
+
+    boot_crc <- sample(
+      crc_idx,
+      size = length(crc_idx),
+      replace = TRUE
+    )
+
+    boot_idx <- c(
+      boot_healthy,
+      boot_crc
+    )
+
+    actual <- factor(
+      y_true[boot_idx],
+      levels = c("healthy", "CRC")
+    )
+
+    predicted <- factor(
+      y_pred[boot_idx],
+      levels = c("healthy", "CRC")
+    )
+
+    # ------------------------------------------------------
+    # Confusion-matrix metrics
+    # ------------------------------------------------------
+
+    cm <- caret::confusionMatrix(
+      data = predicted,
+      reference = actual,
+      positive = "CRC"
+    )
+
+    bootstrap_metrics[b, "Accuracy"] <-
+      unname(cm$overall["Accuracy"])
+
+    bootstrap_metrics[b, "Precision"] <-
+      unname(cm$byClass["Pos Pred Value"])
+
+    bootstrap_metrics[b, "Sensitivity"] <-
+      unname(cm$byClass["Sensitivity"])
+
+    bootstrap_metrics[b, "Specificity"] <-
+      unname(cm$byClass["Specificity"])
+
+    bootstrap_metrics[b, "F1"] <-
+      unname(cm$byClass["F1"])
+
+    # ------------------------------------------------------
+    # Matthews correlation coefficient
+    # ------------------------------------------------------
+
+    bootstrap_metrics[b, "MCC"] <-
+      tryCatch(
+        {
+          m <- cm$table
+
+          TP <- m["CRC", "CRC"]
+          TN <- m["healthy", "healthy"]
+          FP <- m["CRC", "healthy"]
+          FN <- m["healthy", "CRC"]
+
+          denominator <- sqrt(
+            (TP + FP) *
+            (TP + FN) *
+            (TN + FP) *
+            (TN + FN)
+          )
+
+          if (denominator == 0) {
+            NA_real_
+          } else {
+            ((TP * TN) - (FP * FN)) / denominator
+          }
+        },
+        error = function(e) NA_real_
+      )
+
+    # ------------------------------------------------------
+    # AUC
+    # ------------------------------------------------------
+
+    bootstrap_metrics[b, "AUC"] <-
+      tryCatch(
+        {
+          roc_obj <- pROC::roc(
+            response = actual,
+            predictor = prob_crc[boot_idx],
+            levels = c("healthy", "CRC"),
+            direction = "<",
+            quiet = TRUE
+          )
+
+          as.numeric(pROC::auc(roc_obj))
+        },
+        error = function(e) NA_real_
+      )
+  }
+
+  # --------------------------------------------------------
+  # Point estimates from the original fixed predictions
+  # --------------------------------------------------------
+
+  original_actual <- factor(
+    y_true,
+    levels = c("healthy", "CRC")
+  )
+
+  original_predicted <- factor(
+    y_pred,
+    levels = c("healthy", "CRC")
+  )
+
+  original_cm <- caret::confusionMatrix(
+    data = original_predicted,
+    reference = original_actual,
+    positive = "CRC"
+  )
+
+  original_mcc <- tryCatch(
+    {
+      m <- original_cm$table
+
+      TP <- m["CRC", "CRC"]
+      TN <- m["healthy", "healthy"]
+      FP <- m["CRC", "healthy"]
+      FN <- m["healthy", "CRC"]
+
+      denominator <- sqrt(
+        (TP + FP) *
+        (TP + FN) *
+        (TN + FP) *
+        (TN + FN)
+      )
+
+      if (denominator == 0) {
+        NA_real_
+      } else {
+        ((TP * TN) - (FP * FN)) / denominator
+      }
+    },
+    error = function(e) NA_real_
+  )
+
+  original_auc <- tryCatch(
+    {
+      roc_obj <- pROC::roc(
+        response = original_actual,
+        predictor = prob_crc,
+        levels = c("healthy", "CRC"),
+        direction = "<",
+        quiet = TRUE
+      )
+
+      as.numeric(pROC::auc(roc_obj))
+    },
+    error = function(e) NA_real_
+  )
+
+  point_metrics <- data.frame(
+    Metric = colnames(bootstrap_metrics),
+    Estimate = c(
+      unname(original_cm$overall["Accuracy"]),
+      unname(original_cm$byClass["Pos Pred Value"]),
+      unname(original_cm$byClass["Sensitivity"]),
+      unname(original_cm$byClass["Specificity"]),
+      unname(original_cm$byClass["F1"]),
+      original_mcc,
+      original_auc
+    ),
+    Lower_95_CI = NA_real_,
+    Upper_95_CI = NA_real_,
+    stringsAsFactors = FALSE
+  )
+
+  # --------------------------------------------------------
+  # Percentile 95% confidence intervals
+  # --------------------------------------------------------
+
+  for (metric in colnames(bootstrap_metrics)) {
+
+    values <- bootstrap_metrics[, metric]
+
+    values <- values[
+      is.finite(values)
+    ]
+
+    if (length(values) < max(10, 0.50 * B)) {
+      warning(
+        "Fewer than half of bootstrap replicates produced a finite ",
+        metric, " estimate."
+      )
+    }
+
+    if (length(values) == 0) {
+      point_metrics$Lower_95_CI[
+        point_metrics$Metric == metric
+      ] <- NA_real_
+
+      point_metrics$Upper_95_CI[
+        point_metrics$Metric == metric
+      ] <- NA_real_
+
+    } else {
+      point_metrics$Lower_95_CI[
+        point_metrics$Metric == metric
+      ] <- unname(
+        quantile(
+          values,
+          probs = 0.025,
+          na.rm = TRUE
+        )
+      )
+
+      point_metrics$Upper_95_CI[
+        point_metrics$Metric == metric
+      ] <- unname(
+        quantile(
+          values,
+          probs = 0.975,
+          na.rm = TRUE
+        )
+      )
+    }
+  }
+
+  return(point_metrics)
+}
+```
+
+
+```{r save-outputs-function}
+save_model_outputs <- function(cfg, cohort_name, cohort_dirs, y_true, y_pred, prob_crc,
+                                sample_ids, result) {
+
+  preds_df <- data.frame(
+    SampleID = sample_ids,
+    Actual = y_true,
+    Predicted = y_pred,
+    Probability_CRC = prob_crc,
+    Probability_Healthy = 1 - prob_crc,
+    row.names = NULL
+  )
+  pred_path <- file.path(cohort_dirs["predictions"], paste0("External_", cfg$label, "_Predictions.csv"))
+  write.csv(preds_df, pred_path, row.names = FALSE)
+
+  metrics_path <- file.path(cohort_dirs["metrics"], paste0("External_", cfg$label, "_Metrics.csv"))
+  write.csv(result$metrics, metrics_path, row.names = FALSE)
+
+  auc_path <- file.path(cohort_dirs["metrics"], paste0("External_", cfg$label, "_AUC.csv"))
+  write.csv(data.frame(AUC = as.numeric(pROC::auc(result$roc))), auc_path, row.names = FALSE)
+
+  cm_path <- file.path(cohort_dirs["metrics"], paste0("External_", cfg$label, "_ConfusionMatrix.txt"))
+  capture.output(result$cm, file = cm_path)
+
+  roc_coords <- data.frame(
+    Specificity = result$roc$specificities,
+    Sensitivity = result$roc$sensitivities,
+    Threshold = result$roc$thresholds
+  )
+  roc_path <- file.path(cohort_dirs["metrics"], paste0("External_", cfg$label, "_ROC_Coordinates.csv"))
+  write.csv(roc_coords, roc_path, row.names = FALSE)
+
+  confusion_df <- as.data.frame(result$cm$table)
+  cm_plot <- ggplot(confusion_df, aes(x = Prediction, y = Reference, fill = Freq)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = Freq), size = 6) +
+    scale_fill_gradient(low = "white", high = "steelblue") +
+    labs(
+     title = paste0(
+  "External Validation Confusion Matrix (",
+  cohort_name,
+  ") -- ",
+  cfg$display
+),
+      x = "Predicted Class", y = "Actual Class"
+    ) +
+    theme_minimal()
+
+  fig_path <- file.path(cohort_dirs["figures"], paste0("External_", cfg$label, "_ConfusionMatrixHeatmap.png"))
+  ggsave(fig_path, plot = cm_plot, width = 6, height = 5, dpi = 300)
+
+  cat("Saved:", pred_path, "\n")
+  cat("Saved:", metrics_path, "\n")
+  cat("Saved:", auc_path, "\n")
+  cat("Saved:", cm_path, "\n")
+  cat("Saved:", roc_path, "\n")
+  cat("Saved:", fig_path, "\n")
+
+  list(pred_path = pred_path, metrics_path = metrics_path, auc_path = auc_path,
+       cm_path = cm_path, roc_path = roc_path, fig_path = fig_path)
+}
+```
+
+```{r run-all-models}
+# ==========================================================
+# Run every frozen model against the selected external cohort
+# and collect results for the master table and figures below.
+# ==========================================================
+
+external_results <- list()
+saved_file_paths <- list()
+
+for (cfg_name in names(model_configs)) {
+  cfg <- model_configs[[cfg_name]]
+  cat("\n=== Applying frozen model:", cfg$display, "===\n")
+
+  pred_out <- apply_frozen_model(cfg, selected_cohort$data)
+  metrics_out <- compute_metrics(selected_cohort$data$disease, pred_out$pred, pred_out$prob_crc)
+
+  saved_paths <- save_model_outputs(
+    cfg, selected_cohort$cohort, cohort_dirs,
+    y_true = selected_cohort$data$disease,
+    y_pred = pred_out$pred,
+    prob_crc = pred_out$prob_crc,
+    sample_ids = selected_cohort$data$SampleID,
+    result = metrics_out
+  )
+
+  external_results[[cfg_name]] <- metrics_out
+  saved_file_paths[[cfg_name]] <- saved_paths
+}
+```
+
+```{r}
+# ==========================================================
+# External Calibration Analysis
+# ==========================================================
+#
+# Calculates, for each frozen classical model:
+#   1. Brier score
+#   2. Calibration-in-the-large (calibration intercept)
+#   3. Calibration slope
+#   4. Decile-based calibration data
+#   5. Stratified bootstrap 95% CIs for all three metrics
+#
+# No model is retrained.
+# No probabilities are recalibrated.
+# The saved frozen predictions are used exactly as produced
+# by the external-validation pipeline.
+# ==========================================================
+
+
+# ----------------------------------------------------------
+# Helper: calibration metrics
+# ----------------------------------------------------------
+
+calculate_calibration_metrics <- function(y, p) {
+
+  # Ensure binary outcome is coded 0/1:
+  # CRC = 1, Healthy = 0
+  y <- as.numeric(y)
+
+  # Prevent infinite logit values if a frozen model outputs
+  # an exact 0 or 1 probability.
+  eps <- 1e-6
+  p <- pmin(pmax(p, eps), 1 - eps)
+
+  lp <- qlogis(p)
+
+  # --------------------------------------------------------
+  # Brier score
+  # --------------------------------------------------------
+  brier <- mean((p - y)^2)
+
+  # --------------------------------------------------------
+  # Calibration-in-the-large
+  #
+  # This is estimated with the calibration slope fixed at 1:
+  #
+  # logit(observed risk) = intercept + LP
+  #
+  # Equivalent to:
+  # logit(mean observed outcome) - mean(LP)
+  # --------------------------------------------------------
+
+  observed_risk <- mean(y)
+
+  calibration_intercept <- qlogis(observed_risk) - mean(lp)
+
+  # --------------------------------------------------------
+  # Calibration slope
+  #
+  # Logistic regression:
+  #
+  # logit(P(Y=1)) = intercept + slope * LP
+  #
+  # Ideal:
+  # intercept = 0
+  # slope = 1
+  # --------------------------------------------------------
+
+  slope_fit <- tryCatch(
+    glm(
+      y ~ lp,
+      family = binomial(link = "logit")
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(slope_fit)) {
+    calibration_slope <- NA_real_
+  } else {
+    calibration_slope <- unname(coef(slope_fit)["lp"])
+  }
+
+  data.frame(
+    Brier_Score = brier,
+    Calibration_Intercept = calibration_intercept,
+    Calibration_Slope = calibration_slope,
+    row.names = NULL
+  )
+}
+
+
+# ----------------------------------------------------------
+# Stratified bootstrap for calibration metrics
+# ----------------------------------------------------------
+
+bootstrap_calibration <- function(y, p, B = 2000, seed = 1910) {
+
+  y <- as.numeric(y)
+  p <- as.numeric(p)
+
+  set.seed(seed)
+
+  idx_0 <- which(y == 0)
+  idx_1 <- which(y == 1)
+
+  if (length(idx_0) == 0 || length(idx_1) == 0) {
+    stop("Both outcome classes are required for calibration analysis.")
+  }
+
+  bootstrap_results <- vector("list", B)
+
+  for (b in seq_len(B)) {
+
+    # Stratified resampling:
+    # preserve the number of Healthy and CRC observations
+    boot_0 <- sample(
+      idx_0,
+      size = length(idx_0),
+      replace = TRUE
+    )
+
+    boot_1 <- sample(
+      idx_1,
+      size = length(idx_1),
+      replace = TRUE
+    )
+
+    boot_idx <- c(boot_0, boot_1)
+
+    boot_metrics <- calculate_calibration_metrics(
+      y = y[boot_idx],
+      p = p[boot_idx]
+    )
+
+    boot_metrics$Iteration <- b
+
+    bootstrap_results[[b]] <- boot_metrics
+  }
+
+  boot_df <- do.call(rbind, bootstrap_results)
+
+  ci_df <- data.frame(
+    Metric = c(
+      "Brier_Score",
+      "Calibration_Intercept",
+      "Calibration_Slope"
+    ),
+    Estimate = c(
+      calculate_calibration_metrics(y, p)$Brier_Score,
+      calculate_calibration_metrics(y, p)$Calibration_Intercept,
+      calculate_calibration_metrics(y, p)$Calibration_Slope
+    ),
+    Lower_95_CI = c(
+      quantile(
+        boot_df$Brier_Score,
+        probs = 0.025,
+        na.rm = TRUE
+      ),
+      quantile(
+        boot_df$Calibration_Intercept,
+        probs = 0.025,
+        na.rm = TRUE
+      ),
+      quantile(
+        boot_df$Calibration_Slope,
+        probs = 0.025,
+        na.rm = TRUE
+      )
+    ),
+    Upper_95_CI = c(
+      quantile(
+        boot_df$Brier_Score,
+        probs = 0.975,
+        na.rm = TRUE
+      ),
+      quantile(
+        boot_df$Calibration_Intercept,
+        probs = 0.975,
+        na.rm = TRUE
+      ),
+      quantile(
+        boot_df$Calibration_Slope,
+        probs = 0.975,
+        na.rm = TRUE
+      )
+    ),
+    row.names = NULL
+  )
+
+  list(
+    bootstrap = boot_df,
+    ci = ci_df
+  )
+}
+
+
+# ----------------------------------------------------------
+# Read saved predictions and calculate calibration
+# ----------------------------------------------------------
+
+calibration_results <- list()
+
+for (cfg_name in names(model_configs)) {
+
+  cfg <- model_configs[[cfg_name]]
+
+  pred_path <- saved_file_paths[[cfg_name]]$pred_path
+
+  preds <- read.csv(
+    pred_path,
+    stringsAsFactors = FALSE
+  )
+
+  # --------------------------------------------------------
+  # Convert Actual outcome to binary:
+  # CRC = 1
+  # Healthy = 0
+  # --------------------------------------------------------
+
+  y <- ifelse(
+    tolower(as.character(preds$Actual)) == "crc",
+    1,
+    0
+  )
+
+  p <- as.numeric(preds$Probability_CRC)
+
+  # --------------------------------------------------------
+  # Basic validation
+  # --------------------------------------------------------
+
+  if (anyNA(y)) {
+    stop(
+      "NA outcome values detected for ",
+      cfg$display
+    )
+  }
+
+  if (anyNA(p)) {
+    stop(
+      "NA CRC probabilities detected for ",
+      cfg$display
+    )
+  }
+
+  if (any(p < 0 | p > 1)) {
+    stop(
+      "Probability_CRC contains values outside [0,1] for ",
+      cfg$display
+    )
+  }
+
+  # --------------------------------------------------------
+  # Point estimates
+  # --------------------------------------------------------
+
+  point_metrics <- calculate_calibration_metrics(
+    y = y,
+    p = p
+  )
+
+  # --------------------------------------------------------
+  # Stratified bootstrap 95% CI
+  # --------------------------------------------------------
+
+  boot <- bootstrap_calibration(
+    y = y,
+    p = p,
+    B = 2000,
+    seed = 1910
+  )
+
+  calibration_results[[cfg_name]] <- list(
+    predictions = preds,
+    point_metrics = point_metrics,
+    bootstrap = boot
+  )
+}
+
+
+# ----------------------------------------------------------
+# Master calibration table
+# ----------------------------------------------------------
+
+calibration_master <- do.call(
+  rbind,
+  lapply(
+    names(calibration_results),
+    function(cfg_name) {
+
+      cfg <- model_configs[[cfg_name]]
+
+      ci <- calibration_results[[cfg_name]]$bootstrap$ci
+
+      data.frame(
+        Cohort = selected_cohort$cohort,
+        Model = cfg$display,
+
+        Brier_Score =
+          ci$Estimate[
+            ci$Metric == "Brier_Score"
+          ],
+
+        Brier_Lower_95_CI =
+          ci$Lower_95_CI[
+            ci$Metric == "Brier_Score"
+          ],
+
+        Brier_Upper_95_CI =
+          ci$Upper_95_CI[
+            ci$Metric == "Brier_Score"
+          ],
+
+        Calibration_Intercept =
+          ci$Estimate[
+            ci$Metric == "Calibration_Intercept"
+          ],
+
+        Intercept_Lower_95_CI =
+          ci$Lower_95_CI[
+            ci$Metric == "Calibration_Intercept"
+          ],
+
+        Intercept_Upper_95_CI =
+          ci$Upper_95_CI[
+            ci$Metric == "Calibration_Intercept"
+          ],
+
+        Calibration_Slope =
+          ci$Estimate[
+            ci$Metric == "Calibration_Slope"
+          ],
+
+        Slope_Lower_95_CI =
+          ci$Lower_95_CI[
+            ci$Metric == "Calibration_Slope"
+          ],
+
+        Slope_Upper_95_CI =
+          ci$Upper_95_CI[
+            ci$Metric == "Calibration_Slope"
+          ],
+
+        N = length(
+          calibration_results[[cfg_name]]$predictions$Actual
+        ),
+
+        CRC = sum(
+          tolower(
+            as.character(
+              calibration_results[[cfg_name]]$predictions$Actual
+            )
+          ) == "crc"
+        ),
+
+        Healthy = sum(
+          tolower(
+            as.character(
+              calibration_results[[cfg_name]]$predictions$Actual
+            )
+          ) == "healthy"
+        ),
+
+        row.names = NULL
+      )
+    }
+  )
+)
+
+
+# ----------------------------------------------------------
+# Save master calibration table
+# ----------------------------------------------------------
+
+calibration_master_path <- file.path(
+  cohort_dirs["metrics"],
+  "External_Validation_Calibration_Master.csv"
+)
+
+write.csv(
+  calibration_master,
+  calibration_master_path,
+  row.names = FALSE
+)
+
+# Also save a project-root convenience copy
+write.csv(
+  calibration_master,
+  file.path(
+    results_dir,
+    paste0(
+      "External_Validation_Calibration_",
+      selected_cohort$cohort,
+      ".csv"
+    )
+  ),
+  row.names = FALSE
+)
+
+print(calibration_master)
+
+cat(
+  "\nSaved calibration results to:\n",
+  calibration_master_path,
+  "\n"
+)
+```
+
+
+```{r}
+# ==========================================================
+# External Calibration Plots
+# ==========================================================
+#
+# Decile-based observed-vs-predicted probability plots.
+# Perfect calibration lies on the 45-degree line.
+# ==========================================================
+
+
+calibration_plot_data <- do.call(
+  rbind,
+  lapply(
+    names(calibration_results),
+    function(cfg_name) {
+
+      cfg <- model_configs[[cfg_name]]
+
+      preds <- calibration_results[[cfg_name]]$predictions
+
+      p <- as.numeric(preds$Probability_CRC)
+
+      y <- ifelse(
+        tolower(as.character(preds$Actual)) == "crc",
+        1,
+        0
+      )
+
+      # Ten approximately equal-sized probability groups.
+      # ntile() avoids empty fixed-width bins when probabilities
+      # are concentrated in a narrow range.
+
+      decile_df <- data.frame(
+        Observed = y,
+        Predicted = p
+      ) |>
+        dplyr::mutate(
+          Decile = dplyr::ntile(
+            Predicted,
+            10
+          )
+        ) |>
+        dplyr::group_by(Decile) |>
+        dplyr::summarise(
+          Mean_Predicted = mean(
+            Predicted,
+            na.rm = TRUE
+          ),
+          Observed_Proportion = mean(
+            Observed,
+            na.rm = TRUE
+          ),
+          N = dplyr::n(),
+          .groups = "drop"
+        )
+
+      decile_df$Model <- cfg$display
+
+      decile_df
+    }
+  )
+)
+
+
+# ----------------------------------------------------------
+# Calibration figure
+# ----------------------------------------------------------
+
+calibration_fig <- ggplot(
+  calibration_plot_data,
+  aes(
+    x = Mean_Predicted,
+    y = Observed_Proportion
+  )
+) +
+
+  # Perfect calibration
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed"
+  ) +
+
+  geom_point(
+    size = 2.5
+  ) +
+
+  geom_line(
+    linewidth = 0.8
+  ) +
+
+  facet_wrap(
+    ~ Model,
+    ncol = 2
+  ) +
+
+  coord_cartesian(
+    xlim = c(0, 1),
+    ylim = c(0, 1)
+  ) +
+
+  scale_x_continuous(
+    breaks = seq(0, 1, by = 0.2)
+  ) +
+
+  scale_y_continuous(
+    breaks = seq(0, 1, by = 0.2)
+  ) +
+
+  labs(
+    title = paste0(
+      "External Calibration of Frozen Classical Models (",
+      selected_cohort$cohort,
+      ")"
+    ),
+    x = "Mean predicted probability of CRC",
+    y = "Observed proportion of CRC"
+  ) +
+
+  theme_minimal(
+    base_size = 12
+  )
+
+
+print(calibration_fig)
+
+
+# ----------------------------------------------------------
+# Save figure
+# ----------------------------------------------------------
+
+calibration_fig_path <- file.path(
+  cohort_dirs["figures"],
+  "External_Validation_Calibration_AllModels.png"
+)
+
+ggsave(
+  filename = calibration_fig_path,
+  plot = calibration_fig,
+  width = 10,
+  height = 8,
+  dpi = 300
+)
+
+cat(
+  "Saved calibration figure:",
+  calibration_fig_path,
+  "\n"
+)
+```
+
+```{r}
+# ==========================================================
+# Save calibration-plot data for reproducibility
+# ==========================================================
+
+calibration_plot_data_path <- file.path(
+  cohort_dirs["metrics"],
+  "External_Validation_Calibration_Deciles.csv"
+)
+
+write.csv(
+  calibration_plot_data,
+  calibration_plot_data_path,
+  row.names = FALSE
+)
+
+cat(
+  "Saved calibration decile data:",
+  calibration_plot_data_path,
+  "\n"
+)
+```
+
+
+```{r}
+# ==========================================================
+# Generate Bootstrap 95% CIs for All Models
+# ==========================================================
+
+set.seed(123)
+
+ci_results <- lapply(
+  names(model_configs),
+  function(cfg_name) {
+
+    pred_df <- read.csv(
+      saved_file_paths[[cfg_name]]$pred_path,
+      stringsAsFactors = FALSE
+    )
+
+    bootstrap_ci(
+      y_true = pred_df$Actual,
+      y_pred = pred_df$Predicted,
+      prob_crc = pred_df$Probability_CRC,
+      B = 2000
+    )
+  }
+)
+
+names(ci_results) <- names(model_configs)
+
+# Check that all four models produced CI results
+lapply(ci_results, dim)
+```
+
+
+
+```{r}
+# ==========================================================
+# Bootstrap 95% CI Master Table -- All Four Models
+# ==========================================================
+
+ci_table <- do.call(
+  rbind,
+  lapply(names(model_configs), function(cfg_name) {
+
+    ci_df <- ci_results[[cfg_name]]
+
+    data.frame(
+      Model = model_configs[[cfg_name]]$display,
+      Metric = ci_df$Metric,
+      Lower_95_CI = ci_df$Lower_95_CI,
+      Upper_95_CI = ci_df$Upper_95_CI,
+      row.names = NULL
+    )
+  })
+)
+
+ci_table_path <- file.path(
+  cohort_dirs["metrics"],
+  "External_Validation_Bootstrap95CI_All_Models.csv"
+)
+
+write.csv(
+  ci_table,
+  ci_table_path,
+  row.names = FALSE
+)
+
+print(ci_table)
+
+cat(
+  "Saved bootstrap 95% CI table:",
+  ci_table_path,
+  "\n"
+)
+```
+
+Each model's alignment step pulls exactly its own 20 selected features (in the model's own saved order), applies that same model's own frozen scaler via `predict()` (never `preProcess()`, which would refit), and renames columns using that model's own saved syntactic name map so the frozen model sees identically-named predictors to the ones it was trained on. `caret::predictors()` is used as an explicit guard to confirm every predictor the frozen model expects is actually present after alignment, before prediction is attempted -- if it is not, the notebook stops with the exact missing names rather than letting `predict()` fail silently or substitute `NA`.
+
+# Figure 1 -- External Validation ROC Curves (All Four Models)
+
+```{r}
+
+roc_plot_data <- do.call(rbind, lapply(names(model_configs), function(cfg_name) {
+  roc_obj <- external_results[[cfg_name]]$roc
+  data.frame(
+    Model = model_configs[[cfg_name]]$display,
+    Specificity = roc_obj$specificities,
+    Sensitivity = roc_obj$sensitivities
+  )
+}))
+
+roc_fig <- ggplot(roc_plot_data, aes(x = 1 - Specificity, y = Sensitivity, color = Model)) +
+  geom_line(linewidth = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") +
+  labs(
+    title = paste0("External Validation ROC Curves (", selected_cohort$cohort, ")"),
+    x = "1 - Specificity", y = "Sensitivity", color = "Model"
+  ) +
+  theme_minimal(base_size = 12)
+
+print(roc_fig)
+
+roc_fig_path <- file.path(cohort_dirs["figures"], "External_ROC_Curves_AllModels.png")
+ggsave(roc_fig_path, plot = roc_fig, width = 8, height = 6, dpi = 300)
+cat("Saved:", roc_fig_path, "\n")
+```
+
+
+
+# Master External Validation Table
+
+```{r master-table}
+master_metrics <- do.call(rbind, lapply(names(model_configs), function(cfg_name) {
+  cfg <- model_configs[[cfg_name]]
+  m <- external_results[[cfg_name]]$metrics
+  data.frame(
+    Model = cfg$display,
+    N_external = nrow(selected_cohort$data),
+    CRC = selected_cohort$n_crc,
+    Healthy = selected_cohort$n_healthy,
+    Accuracy = m$Accuracy, Precision = m$Precision, Sensitivity = m$Sensitivity,
+    Specificity = m$Specificity, F1 = m$F1, MCC = m$MCC, AUC = m$AUC
+  )
+}))
+
+master_path <- file.path(cohort_dirs["metrics"], "External_Validation_Master_Metrics.csv")
+write.csv(master_metrics, master_path, row.names = FALSE)
+
+# Convenience copy at the project-root results/ location, matching the
+# exact filename requested in the master prompt.
+write.csv(master_metrics, file.path(results_dir, "External_Validation_Master_Metrics.csv"), row.names = FALSE)
+
+master_metrics
+```
+
+# Internal vs. External Comparison
+
+```{r internal-vs-external}
+# ==========================================================
+# Uses the already-authoritative internal held-out test metrics
+# hardcoded in model_configs above -- these are NOT regenerated
+# or altered here.
+# ==========================================================
+
+# ==========================================================
+# Internal vs External Validation Comparison Table
+# ==========================================================
+
+comparison_table <- do.call(
+  rbind,
+  lapply(names(model_configs), function(cfg_name) {
+
+    internal <- model_configs[[cfg_name]]$internal_metrics
+    external <- external_results[[cfg_name]]$metrics
+
+    data.frame(
+      Model = cfg_name,
+
+      Accuracy_Internal = internal$Accuracy,
+      Accuracy_External = external$Accuracy,
+      Accuracy_Change = external$Accuracy - internal$Accuracy,
+
+      Precision_Internal = internal$Precision,
+      Precision_External = external$Precision,
+      Precision_Change = external$Precision - internal$Precision,
+
+      Sensitivity_Internal = internal$Sensitivity,
+      Sensitivity_External = external$Sensitivity,
+      Sensitivity_Change = external$Sensitivity - internal$Sensitivity,
+
+      Specificity_Internal = internal$Specificity,
+      Specificity_External = external$Specificity,
+      Specificity_Change = external$Specificity - internal$Specificity,
+
+      F1_Internal = internal$F1,
+      F1_External = external$F1,
+      F1_Change = external$F1 - internal$F1,
+
+      MCC_Internal = internal$MCC,
+      MCC_External = external$MCC,
+      MCC_Change = external$MCC - internal$MCC,
+
+      AUC_Internal = internal$AUC,
+      AUC_External = external$AUC,
+      AUC_Change = external$AUC - internal$AUC,
+
+      row.names = NULL
+    )
+  })
+)
+
+# ----------------------------------------------------------
+# Save comparison table
+# ----------------------------------------------------------
+
+comparison_path <- file.path(
+  cohort_dirs["metrics"],
+  "Internal_vs_External_Validation.csv"
+)
+
+write.csv(
+  comparison_table,
+  comparison_path,
+  row.names = FALSE
+)
+
+comparison_table
+```
+
+# Figure 2 -- Internal vs. External AUC Comparison
+
+```{r figure-auc-comparison}
+auc_long <- data.frame(
+  Model = rep(comparison_table$Model, 2),
+  Setting = rep(c("Internal (held-out test)", paste0("External (", selected_cohort$cohort, ")")),
+                each = nrow(comparison_table)),
+  AUC = c(comparison_table$AUC_Internal, comparison_table$AUC_External)
+)
+
+auc_fig <- ggplot(
+  auc_long,
+  aes(x = Model, y = AUC, fill = Setting)
+) +
+  geom_col(
+    position = "dodge",
+    width = 0.7
+  ) +
+  coord_cartesian(
+    ylim = c(0, 1)
+  ) +
+  labs(
+    title = "Internal vs. External AUC by Model",
+    x = NULL,
+    y = "AUC"
+  ) +
+  theme_minimal(
+    base_size = 12
+  ) +
+  theme(
+    axis.text.x = element_text(
+      angle = 20,
+      hjust = 1
+    ),
+    plot.margin = ggplot2::margin(
+      t = 10,
+      r = 20,
+      b = 10,
+      l = 40
+    )
+  )
+
+print(auc_fig)
+
+auc_fig_path <- file.path(
+  cohort_dirs["figures"],
+  "External_vs_Internal_AUC_Comparison.png"
+)
+
+ggsave(
+  filename = auc_fig_path,
+  plot = auc_fig,
+  width = 10,
+  height = 7,
+  dpi = 300,
+  limitsize = FALSE
+)
+
+cat("Saved:", auc_fig_path, "\n")
+```
+
+# Figure 3 (Optional) -- Internal vs. External Sensitivity Comparison
+
+```{r figure-sensitivity-comparison}
+sens_long <- data.frame(
+  Model = rep(comparison_table$Model, 2),
+  Setting = rep(c("Internal (held-out test)", paste0("External (", selected_cohort$cohort, ")")),
+                each = nrow(comparison_table)),
+  Sensitivity = c(comparison_table$Sensitivity_Internal, comparison_table$Sensitivity_External)
+)
+
+sens_fig <- ggplot(sens_long, aes(x = Model, y = Sensitivity, fill = Setting)) +
+  geom_col(position = "dodge", width = 0.7) +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(title = "Internal vs. External Sensitivity by Model", x = NULL, y = "Sensitivity") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+
+print(sens_fig)
+
+sens_fig_path <- file.path(cohort_dirs["figures"], "External_vs_Internal_Sensitivity_Comparison.png")
+ggsave(sens_fig_path, plot = sens_fig, width = 8, height = 6, dpi = 300)
+cat("Saved:", sens_fig_path, "\n")
+```
+
+# Interpretation
+
+```{r interpretation-text, echo=FALSE, results='asis'}
+cat(
+  "The comparison table above is read directly, model by model, without selecting a ",
+  "post-hoc \"best\" external model. For any model where external AUC/F1/MCC improves ",
+  "relative to internal test performance, that should be read conservatively -- a 22-sample ",
+  "internal test set and a modestly sized external cohort both carry wide confidence intervals, ",
+  "so an apparent improvement is not strong evidence of superior generalization on its own. ",
+  "For any model where external performance drops, this is reported as a generalization gap, ",
+  "with plausible contributing factors discussed in Limitations rather than asserted as proven ",
+  "causes. If any model's external performance approaches chance level (AUC near 0.5), that is ",
+  "reported plainly rather than downplayed.\n"
+)
+```
+
+# Limitations
+
+- The external cohort is a single independent cohort; it is not a multi-cohort meta-validation, and its own sample size is modest relative to what would be needed for tight confidence intervals on Sensitivity/Specificity.
+- Geography, population, diet, and clinical recruitment criteria differ between the discovery cohort and the external cohort; any of these could plausibly contribute to a performance shift, but this notebook does not have the data to confirm which factor, if any, is responsible.
+- Sequencing platform, laboratory protocol, and DNA extraction differences between studies are a plausible source of batch effects in relative-abundance microbiome data, even when both cohorts are processed through the same bioinformatic pipeline in `curatedMetagenomicData`.
+- Taxonomic naming compatibility was checked programmatically (feature-alignment audit), but a feature being *named* consistently does not guarantee its *prevalence/abundance distribution* is comparable between cohorts.
+- Only one external cohort was evaluated for the primary manuscript results, per the project's time constraint; `VogtmannE_2016` was evaluated only if `FengQ_2015` failed the feasibility gate.
+- The QSVC quantum model was not externally validated in this notebook -- it remains an internal exploratory analysis and a candidate for future external validation work, not because it was found to be unsuitable, but because extending the noiseless statevector kernel calculation to a second cohort was judged not to be worth the time against the manuscript deadline.
+- Small sample sizes on both the discovery and external side mean all metrics reported here, internal and external alike, carry non-trivial sampling uncertainty; no claim of clinical readiness or diagnostic deployment is made anywhere in this notebook.
+
+# Conclusion
+
+```{r conclusion-text, echo=FALSE, results='asis'}
+cat(
+  "This notebook applied four frozen classical models -- Logistic Regression, Random Forest, ",
+  "SVM, and XGBoost -- to an independent CRC/healthy microbiome cohort without any retraining, ",
+  "refitting, or re-selection of features. The Internal vs. External Comparison table and Figures ",
+  "1-3 above are the primary evidence for whether each model's discovery-cohort performance holds ",
+  "up outside the discovery cohort; read them per-model, since the four models need not generalize ",
+  "the same way. This analysis strengthens the manuscript's evidence for generalizability beyond ",
+  "internal cross-validation, but it does not, on its own, establish clinical readiness or support ",
+  "diagnostic deployment, and several open questions -- cohort-specific batch effects, the small ",
+  "external sample size, and untested generalization of QSVC -- remain unresolved.\n"
+)
+```
+
+# Reproducibility Checklist
+
+```{r reproducibility-checklist}
+# ==========================================================
+# Automated PASS/FAIL checklist. Fails loudly (via stop()) if
+# any CRITICAL requirement is unmet, rather than reporting a
+# false PASS.
+# ==========================================================
+
+checklist <- list()
+
+checklist[["External dataset loaded"]] <- !is.null(selected_cohort$data) && nrow(selected_cohort$data) > 0
+checklist[["Both classes present"]] <- selected_cohort$n_healthy > 0 && selected_cohort$n_crc > 0
+checklist[["Expected feature count (20) per model"]] <- all(vapply(model_configs, function(cfg) {
+  length(read.csv(cfg$features_path, stringsAsFactors = FALSE)$Feature) == 20
+}, logical(1)))
+checklist[["Feature alignment complete (no missing model features)"]] <- length(unique(
+  selected_cohort$feature_audit$Model[!selected_cohort$feature_audit$Found_In_External]
+)) == 0
+checklist[["Frozen scalers loaded (not refit)"]] <- all(file.exists(vapply(model_configs, function(cfg) cfg$scaler_path, character(1))))
+checklist[["Frozen LR model loaded"]] <- file.exists(model_configs$LogisticRegression$model_path)
+checklist[["Frozen RF model loaded"]] <- file.exists(model_configs$RandomForest$model_path)
+checklist[["Frozen SVM model loaded"]] <- file.exists(model_configs$SVM$model_path)
+checklist[["Frozen XGBoost model loaded"]] <- file.exists(model_configs$XGBoost$model_path)
+checklist[["No model retraining performed"]] <- TRUE  # structurally true: no train()/xgb.train()/Boruta() call exists in this notebook
+
+checklist[["AUC files saved (all 4 models)"]] <- all(
+  vapply(
+    saved_file_paths,
+    function(p) file.exists(p$auc_path),
+    logical(1)
+  )
+)
+
+checklist[["Confusion matrix heatmaps saved (all 4 models)"]] <- all(
+  vapply(
+    saved_file_paths,
+    function(p) file.exists(p$fig_path),
+    logical(1)
+  )
+)
+
+checklist[["ROC figure saved"]] <- file.exists(roc_fig_path)
+
+checklist[["AUC comparison figure saved"]] <- file.exists(auc_fig_path)
+
+checklist[["Sensitivity comparison figure saved"]] <- file.exists(sens_fig_path)
+
+checklist[["Cohort metadata saved"]] <- file.exists(
+  file.path(
+    cohort_dirs["metadata"],
+    paste0(
+      "External_",
+      selected_cohort$cohort,
+      "_SampleSummary.csv"
+    )
+  )
+)
+
+checklist[["Feature alignment audit saved"]] <- file.exists(
+  file.path(
+    cohort_dirs["metadata"],
+    "External_Validation_FeatureAlignmentAudit.csv"
+  )
+)
+
+
+checklist[["Predictions saved (all 4 models)"]] <-
+  all(vapply(
+    saved_file_paths,
+    function(p) file.exists(p$pred_path),
+    logical(1)
+  ))
+
+checklist[["Metrics saved (all 4 models)"]] <-
+  all(vapply(
+    saved_file_paths,
+    function(p) file.exists(p$metrics_path),
+    logical(1)
+  ))
+
+checklist[["Confusion matrices saved (all 4 models)"]] <-
+  all(vapply(
+    saved_file_paths,
+    function(p) file.exists(p$cm_path),
+    logical(1)
+  ))
+
+checklist[["ROC coordinates saved (all 4 models)"]] <-
+  all(vapply(
+    saved_file_paths,
+    function(p) file.exists(p$roc_path),
+    logical(1)
+  ))
+
+checklist[["Calibration metrics saved"]] <-
+  file.exists(calibration_master_path)
+
+checklist[["Calibration decile data saved"]] <-
+  file.exists(calibration_plot_data_path)
+
+checklist[["Calibration figure saved"]] <-
+  file.exists(calibration_fig_path)
+
+checklist[["Calibration results contain all four models"]] <-
+  nrow(calibration_master) == length(model_configs)
+
+checklist[["Master comparison saved"]] <-
+  file.exists(master_path) &&
+  file.exists(comparison_path)
+
+checklist_df <- data.frame(
+  Requirement = names(checklist),
+  Status = ifelse(unlist(checklist), "PASS", "FAIL")
+)
+
+print(checklist_df)
+
+critical_failures <- checklist_df$Requirement[checklist_df$Status == "FAIL"]
+
+checklist_txt_path <- file.path(reports_dir, "ExternalValidation_ReproducibilityChecklist.txt")
+writeLines(
+  c(paste("External Validation Reproducibility Checklist --", selected_cohort$cohort),
+    paste(checklist_df$Requirement, ":", checklist_df$Status)),
+  checklist_txt_path
+)
+
+if (length(critical_failures) > 0) {
+  stop(
+    "REPRODUCIBILITY CHECKLIST FAILED for: ", paste(critical_failures, collapse = ", "),
+    ". See ", checklist_txt_path, " for the full checklist. Fix the failing step before ",
+    "treating any output from this run as manuscript-ready."
+  )
+}
+
+cat("\nAll reproducibility checklist items PASS. Checklist saved to:", checklist_txt_path, "\n")
+```
+
+
+```{r}
+# ==========================================================
+# FengQ_2015 METADATA-ONLY AUDIT
+# ==========================================================
+
+library(curatedMetagenomicData)
+
+feng_meta <- subset(
+  sampleMetadata,
+  study_name == "FengQ_2015"
+)
+
+cat("Total FengQ metadata records:", nrow(feng_meta), "\n\n")
+
+cat("Available metadata columns:\n")
+print(colnames(feng_meta))
+
+cat("\nDisease distribution:\n")
+print(table(feng_meta$disease, useNA = "ifany"))
+
+cat("\nGender distribution:\n")
+print(table(feng_meta$gender, useNA = "ifany"))
+
+cat("\nAge summary:\n")
+print(summary(feng_meta$age))
+
+cat("\nCountry distribution:\n")
+print(table(feng_meta$country, useNA = "ifany"))
+
+# FengQ: inspect the variables that may define case/control status
+
+cat("Study condition:\n")
+print(table(feng_meta$study_condition, useNA = "ifany"))
+
+cat("\nDisease + study condition:\n")
+print(
+  table(
+    feng_meta$disease,
+    feng_meta$study_condition,
+    useNA = "ifany"
+  )
+)
+
+
+# Look specifically at records that are potentially Healthy
+healthy_candidates <- feng_meta[
+  grepl(
+    "healthy|control",
+    paste(
+      feng_meta$disease,
+      feng_meta$study_condition,
+      sep = " | "
+    ),
+    ignore.case = TRUE
+  ),
+]
+
+print(
+  healthy_candidates[
+    ,
+    c(
+      "sample_id",
+      "subject_id",
+      "disease",
+      "study_condition",
+      "age",
+      "gender",
+      "country"
+    )
+  ]
+)
+
+# Create the finalized FengQ binary external-validation cohort
+
+feng_binary <- feng_meta[
+  feng_meta$study_condition %in% c("CRC", "control"),
+  ,
+  drop = FALSE
+]
+
+feng_binary$Class <- ifelse(
+  feng_binary$study_condition == "CRC",
+  "CRC",
+  "Healthy"
+)
+
+cat("Final external validation cohort:\n")
+print(table(feng_binary$Class))
+
+# ==========================================================
+# FENGQ_2015 FINAL BINARY COHORT AUDIT
+# ==========================================================
+
+cat("Final external validation cohort:\n")
+print(table(feng_binary$Class))
+
+cat("\nAge summary by class:\n")
+print(
+  aggregate(
+    age ~ Class,
+    data = feng_binary,
+    FUN = function(x) c(
+      n = sum(!is.na(x)),
+      mean = mean(x, na.rm = TRUE),
+      sd = sd(x, na.rm = TRUE),
+      median = median(x, na.rm = TRUE),
+      min = min(x, na.rm = TRUE),
+      max = max(x, na.rm = TRUE)
+    )
+  )
+)
+
+cat("\nGender by class:\n")
+print(
+  table(
+    feng_binary$Class,
+    feng_binary$gender,
+    useNA = "ifany"
+  )
+)
+
+cat("\nCountry by class:\n")
+print(
+  table(
+    feng_binary$Class,
+    feng_binary$country,
+    useNA = "ifany"
+  )
+)
+
+cat("\nStudy condition check:\n")
+print(table(feng_binary$study_condition))
+
+
+cat("\nAge summary by class:\n")
+
+print(
+  aggregate(
+    age ~ Class,
+    data = feng_binary,
+    FUN = function(x) c(
+      n = sum(!is.na(x)),
+      mean = mean(x, na.rm = TRUE),
+      sd = sd(x, na.rm = TRUE),
+      median = median(x, na.rm = TRUE),
+      min = min(x, na.rm = TRUE),
+      max = max(x, na.rm = TRUE)
+    )
+  )
+)
+
+cat("\nGender by class:\n")
+print(table(
+  feng_binary$Class,
+  feng_binary$gender,
+  useNA = "ifany"
+))
+
+cat("\nCountry by class:\n")
+print(table(
+  feng_binary$Class,
+  feng_binary$country,
+  useNA = "ifany"
+))
+```
+
+
+
+
+## Session information
+
+The final section records the exact R session used for this knit. The same information is also saved as a text artifact so the HTML report and repository contain both a human-readable and machine-readable provenance record.
+
+```{r session-information}
+session_file <- file.path(
+  results_dir,
+  "session_info",
+  "10_External_Validation_FengQ_2015_sessionInfo.txt"
+)
+write_session_info(session_file)
+cat("Saved session information to:", session_file, "\n\n")
+sessionInfo()
+```

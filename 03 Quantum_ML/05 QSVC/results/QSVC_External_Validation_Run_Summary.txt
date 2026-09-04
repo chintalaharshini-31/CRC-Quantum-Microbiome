@@ -1,0 +1,50 @@
+QSVC EXTERNAL VALIDATION RUN SUMMARY
+====================================
+Project root: C:\CRC\CRC_Quantum_Microbiome_Githb\CRC_Quantum_Microbiome_GitHub_RMD\03 Quantum_ML\05 QSVC
+Seed: 1910
+
+DISCOVERY COHORT
+Zeller et al. (2014), Healthy vs CRC, Adenoma excluded
+Training samples: 92
+Internal test samples: 22
+Frozen top-8 feature source: QSVC_Selected_Top8_Features.csv
+
+EXTERNAL COHORTS
+FengQ_2015: N=107, Healthy=61, CRC=46
+VogtmannE_2016: N=104, Healthy=52, CRC=52
+
+TOP-8 FEATURES
+1. k__Bacteria.p__Firmicutes.c__Clostridia.o__Clostridiales.f__Peptostreptococcaceae.g__Peptostreptococcus.s__Peptostreptococcus_stomatis
+2. k__Bacteria.p__Firmicutes.c__Bacilli.o__Lactobacillales.f__Streptococcaceae.g__Streptococcus.s__Streptococcus_salivarius
+3. k__Bacteria.p__Firmicutes.c__Tissierellia.o__Tissierellales.f__Peptoniphilaceae.g__Parvimonas.s__Parvimonas_micra
+4. k__Bacteria.p__Firmicutes.c__Clostridia.o__Clostridiales.f__Ruminococcaceae.g__Ruthenibacterium.s__Ruthenibacterium_lactatiformans
+5. k__Bacteria.p__Firmicutes.c__Clostridia.o__Clostridiales.f__Lachnospiraceae.g__Anaerostipes.s__Anaerostipes_hadrus
+6. k__Bacteria.p__Proteobacteria.c__Deltaproteobacteria.o__Desulfovibrionales.f__Desulfovibrionaceae.g__Bilophila.s__Bilophila_wadsworthia
+7. k__Bacteria.p__Bacteroidetes.c__Bacteroidia.o__Bacteroidales.f__Bacteroidaceae.g__Bacteroides.s__Bacteroides_uniformis
+8. k__Bacteria.p__Firmicutes.c__Clostridia.o__Clostridiales.f__Oscillospiraceae.g__Oscillibacter.s__Oscillibacter_sp_CAG_241
+
+QUANTUM CONFIGURATION
+Frozen 8-feature QSVC artifact
+Quantum feature map: 8-feature representation used by the serialized QSVC
+Simulation/backend: Qiskit StatevectorSampler
+Simulation type: ideal, noiseless classical statevector simulation
+Physical quantum hardware: none
+Qiskit Aer backend: not used
+
+INTERNAL REPRODUCIBILITY GATE
+PASS
+
+EXTERNAL METRICS
+        Cohort                            Model  Accuracy  Precision  Recall_Sensitivity  Specificity  F1_Score  ROC_AUC      MCC
+    FengQ_2015                QSVC (8 features)  0.514019   0.451613            0.608696     0.442623  0.518519 0.548111 0.051466
+    FengQ_2015  Classical SVM (RBF, 8 features)  0.616822   0.631579            0.260870     0.885246  0.369231 0.664291 0.189287
+    FengQ_2015 Logistic Regression (8 features)  0.700935   0.791667            0.413043     0.918033  0.542857 0.726301 0.392941
+VogtmannE_2016                QSVC (8 features)  0.557692   0.565217            0.500000     0.615385  0.530612 0.614275 0.116160
+VogtmannE_2016  Classical SVM (RBF, 8 features)  0.538462   0.600000            0.230769     0.846154  0.333333 0.577663 0.097590
+VogtmannE_2016 Logistic Regression (8 features)  0.538462   0.566667            0.326923     0.750000  0.414634 0.542899 0.084895
+
+OUTPUTS
+Results: C:\CRC\CRC_Quantum_Microbiome_Githb\CRC_Quantum_Microbiome_GitHub_RMD\03 Quantum_ML\05 QSVC\results
+Figures: C:\CRC\CRC_Quantum_Microbiome_Githb\CRC_Quantum_Microbiome_GitHub_RMD\03 Quantum_ML\05 QSVC\figures
+Models: C:\CRC\CRC_Quantum_Microbiome_Githb\CRC_Quantum_Microbiome_GitHub_RMD\03 Quantum_ML\05 QSVC\models
+Data: C:\CRC\CRC_Quantum_Microbiome_Githb\CRC_Quantum_Microbiome_GitHub_RMD\03 Quantum_ML\05 QSVC\data

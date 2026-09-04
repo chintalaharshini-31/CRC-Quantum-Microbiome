@@ -1,0 +1,23 @@
+Check,Pass
+Random seed == 1910,True
+Discovery training samples == 92,True
+Discovery internal test samples == 22,True
+Discovery binary classes are Healthy/CRC only,True
+Exactly 20 discovery features before top-8 reduction,True
+Exactly 8 frozen features,True
+Top-8 features are present in discovery train/test,True
+Angle scaler has 8 input features,True
+No external cohort was used in feature selection,True
+No external cohort was used to fit the angle scaler,True
+No external cohort was used to fit the matched LR,True
+Frozen QSVC loaded successfully,True
+Frozen classical SVM loaded successfully,True
+Matched LR model saved,True
+FengQ external cohort contains 20 frozen features,True
+VogtmannE external cohort contains 20 frozen features,True
+FengQ top-8 alignment passed,True
+VogtmannE top-8 alignment passed,True
+Internal reproducibility gate passed,True
+Master external metrics saved,True
+Master external CIs saved,True
+All prediction files saved,True

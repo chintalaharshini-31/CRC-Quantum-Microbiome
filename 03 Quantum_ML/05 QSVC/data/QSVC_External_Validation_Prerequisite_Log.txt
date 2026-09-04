@@ -1,0 +1,21 @@
+QSVC EXTERNAL VALIDATION PREREQUISITE EXPORT
+=============================================
+Export date: 2026-09-04 22:59:39
+Random seed: 1910
+
+FROZEN DISCOVERY ARTIFACTS
+C:/CRC/CRC_Quantum_Microbiome_Githb/CRC_Quantum_Microbiome_GitHub_RMD/02 Classical ML/results/Binary_Selected_20_Features.csv
+C:/CRC/CRC_Quantum_Microbiome_Githb/CRC_Quantum_Microbiome_GitHub_RMD/02 Classical ML/models/Scaler.rds
+C:/CRC/CRC_Quantum_Microbiome_Githb/CRC_Quantum_Microbiome_GitHub_RMD/03 Quantum_ML/05 QSVC/data/QSVC_Feature_Name_Map.csv
+
+EXTERNAL OUTPUTS
+C:/CRC/CRC_Quantum_Microbiome_Githb/CRC_Quantum_Microbiome_GitHub_RMD/03 Quantum_ML/05 QSVC/data/QSVC_External_FengQ_2015_Data.csv
+C:/CRC/CRC_Quantum_Microbiome_Githb/CRC_Quantum_Microbiome_GitHub_RMD/03 Quantum_ML/05 QSVC/data/QSVC_External_VogtmannE_2016_Data.csv
+C:/CRC/CRC_Quantum_Microbiome_Githb/CRC_Quantum_Microbiome_GitHub_RMD/03 Quantum_ML/05 QSVC/data/QSVC_External_Validation_Cohort_Summary.csv
+
+IMPORTANT
+No external feature selection was performed.
+No external scaler was fitted.
+No model was retrained.
+The exported features are the frozen discovery 20-feature panel
+after applying the frozen discovery-trained center/scale transformation.

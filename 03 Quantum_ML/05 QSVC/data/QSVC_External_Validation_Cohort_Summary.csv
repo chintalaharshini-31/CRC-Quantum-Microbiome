@@ -1,0 +1,3 @@
+"Cohort","N_Total","N_Healthy","N_CRC","Feature_Count","Scaler","Feature_Source","Output_File"
+"FengQ_2015",107,61,46,20,"Frozen Zeller discovery Scaler.rds","Frozen Binary_Selected_20_Features.csv","C:/CRC/CRC_Quantum_Microbiome_Githb/CRC_Quantum_Microbiome_GitHub_RMD/03 Quantum_ML/05 QSVC/data/QSVC_External_FengQ_2015_Data.csv"
+"VogtmannE_2016",104,52,52,20,"Frozen Zeller discovery Scaler.rds","Frozen Binary_Selected_20_Features.csv","C:/CRC/CRC_Quantum_Microbiome_Githb/CRC_Quantum_Microbiome_GitHub_RMD/03 Quantum_ML/05 QSVC/data/QSVC_External_VogtmannE_2016_Data.csv"

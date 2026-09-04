@@ -1,0 +1,50 @@
+QSVC Run Summary
+=================
+Project: Quantum-Assisted Microbiome Biomarker Discovery for Colorectal Cancer Classification
+Dataset: Zeller et al. (2014) gut microbiome relative abundance (curatedMetagenomicData)
+Classification task: Binary, Healthy vs CRC (Adenoma excluded)
+Random seed (SEED): 1910
+
+-- Data --
+Training samples: 92 (expected 92)
+Testing samples : 22 (expected 22)
+Initial Boruta-selected feature count: 20 (expected 20)
+Final QSVC feature count (top-k reduction): 8 (expected 8)
+
+-- Feature Selection --
+Feature-selection method: RandomForestClassifier Gini importance, fit on training data only
+Top 8 features (syntactic names): ['k__Bacteria.p__Firmicutes.c__Clostridia.o__Clostridiales.f__Peptostreptococcaceae.g__Peptostreptococcus.s__Peptostreptococcus_stomatis', 'k__Bacteria.p__Firmicutes.c__Bacilli.o__Lactobacillales.f__Streptococcaceae.g__Streptococcus.s__Streptococcus_salivarius', 'k__Bacteria.p__Firmicutes.c__Tissierellia.o__Tissierellales.f__Peptoniphilaceae.g__Parvimonas.s__Parvimonas_micra', 'k__Bacteria.p__Firmicutes.c__Clostridia.o__Clostridiales.f__Ruminococcaceae.g__Ruthenibacterium.s__Ruthenibacterium_lactatiformans', 'k__Bacteria.p__Firmicutes.c__Clostridia.o__Clostridiales.f__Lachnospiraceae.g__Anaerostipes.s__Anaerostipes_hadrus', 'k__Bacteria.p__Proteobacteria.c__Deltaproteobacteria.o__Desulfovibrionales.f__Desulfovibrionaceae.g__Bilophila.s__Bilophila_wadsworthia', 'k__Bacteria.p__Bacteroidetes.c__Bacteroidia.o__Bacteroidales.f__Bacteroidaceae.g__Bacteroides.s__Bacteroides_uniformis', 'k__Bacteria.p__Firmicutes.c__Clostridia.o__Clostridiales.f__Oscillospiraceae.g__Oscillibacter.s__Oscillibacter_sp_CAG_241']
+
+-- Quantum Feature Map --
+Feature map: ZZFeatureMap, feature_dimension=8, reps=1, entanglement='linear'
+
+-- Quantum Kernel --
+Kernel: FidelityQuantumKernel (ComputeUncompute + StatevectorSampler, exact noiseless simulation)
+K_train shape: (92, 92), computation time: 73.84 s
+
+-- QSVC Training --
+QSVC training time: 72.62 s
+QSVC prediction time (22 test samples): 35.1613 s
+
+-- Final Test Metrics: QSVC (8 features) --
+  Accuracy: 0.5455
+  Precision: 0.5000
+  Recall_Sensitivity: 0.6000
+  Specificity: 0.5000
+  F1_Score: 0.5455
+  ROC_AUC: 0.6083
+  MCC: 0.1000
+
+-- Final Test Metrics: Classical SVM baseline (same 8 features) --
+  Accuracy: 0.5909
+  Precision: 0.5714
+  Recall_Sensitivity: 0.4000
+  Specificity: 0.7500
+  F1_Score: 0.4706
+  ROC_AUC: 0.6000
+
+-- Important Scope Note --
+This QSVC pipeline does NOT use the same 20-feature space as the four primary
+classical models (Logistic Regression, SVM, Random Forest, XGBoost). It uses an
+additional, training-data-only top-8 reduction of that 20-feature space, made
+necessary by the computational cost of exact quantum kernel simulation.
