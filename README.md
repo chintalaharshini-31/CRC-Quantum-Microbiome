@@ -226,38 +226,7 @@ For a true clean-room reproduction, a user should restore the environments, run 
 
 ---
 
-## 10. Repository hygiene
 
 
-The repository intentionally excludes:
 
-- `.venv/`
-- `.Rproj.user/`
-- `.Rhistory`
-- personal OneDrive paths
-- temporary editor state
-- duplicate project ZIP archives
-- unrelated presentation files
-- manuscript drafting prompts
-
-The old one-split baseline GitHub repository should **not** be treated as the canonical project repository. Keep it separate or archive it. This repository is the clean manuscript-linked analysis repository.
-
----
-
-## 11. Suggested GitHub landing page
-
-The repository root is deliberately organized so that a reviewer can go:
-
-**README → Classical ML / Quantum ML → notebook → results → session information**
-
-without having to excavate your laptop's archaeological strata.
-
-Before adding the repository URL to the manuscript, perform one clean reproduction run from the repository root and confirm that the expected outputs are regenerated without changing the locked scientific settings.
-
-
-## 11. GitHub push
-
-This repository snapshot is intended to be the clean manuscript-linked analysis repository. It contains the currently knitted R Markdown reports, executed QSVC notebooks, saved analysis artifacts, figures, model objects, and provenance files. It deliberately excludes the installed `renv` library and local editor state.
-
-For the final submission, make any required manuscript-only edits separately. Do not regenerate analysis outputs merely for Git packaging unless a scientific discrepancy has been identified and resolved.
 
